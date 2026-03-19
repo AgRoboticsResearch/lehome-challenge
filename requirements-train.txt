@@ -1,0 +1,19 @@
+# Training-only dependencies (no Isaac Sim)
+# For lan102 - Ubuntu 20.04 compatible
+
+# Core ML framework
+torch==2.7.0
+torchvision==0.22.0
+
+# LeRobot and dependencies
+lerobot==0.4.3
+
+# Additional dependencies
+num2words>=0.5.14
+open3d>=0.19.0
+transformers>=4.57.6
+transforms3d>=0.4.2
+
+# Override specific versions
+packaging==23.0
+numpy==1.26.0

@@ -1,0 +1,46 @@
+dataset:
+  repo_id: repo_smolvla_pant_short
+  root: Datasets/example/pant_short_merged
+
+policy:
+  type: smolvla
+  pretrained_path: lerobot/smolvla_base
+  device: cuda
+  push_to_hub: false
+
+  # MoE Expert 训练：冻结整个 VLM（SigLIP + LM backbone），只训练 lm_expert
+  # train_expert_only: true  → 冻结 vlm.parameters()（包含 SigLIP 和 LM）
+  # freeze_vision_encoder: true → 已被 train_expert_only 包含，显式写出更清晰
+  train_expert_only: true    # 冻结 vlm.parameters() 整体，确保 4 个 Expert 共享相同 VLM
+  freeze_vision_encoder: true  # 已被 train_expert_only 包含，显式写出更清晰
+  train_state_proj: false    # 共享 state_proj，冻结不训练
+
+  input_features:
+    observation.state:
+      type: STATE
+      shape: [12]
+    observation.images.top_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.left_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.right_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [12]
+
+output_dir: outputs/train/smolvla_moe_expert_pant_short
+batch_size: 32   # freeze VLM 省显存，batch_size 可以开大
+steps: 20000
+save_freq: 1000
+log_freq: 100
+
+wandb:
+  enable: true
+  project: lehome-challenge
+

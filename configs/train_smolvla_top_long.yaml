@@ -1,0 +1,43 @@
+dataset:
+  repo_id: repo_smolvla_top_long
+  root: Datasets/example/top_long_merged
+
+policy:
+  type: smolvla
+  pretrained_path: lerobot/smolvla_base
+  device: cuda
+  push_to_hub: false
+
+  # Full fine-tuning: unfreeze VLM backbone for MA
+  train_expert_only: false
+  freeze_vision_encoder: false
+  train_state_proj: true
+
+  input_features:
+    observation.state:
+      type: STATE
+      shape: [12]
+    observation.images.top_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.left_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.right_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [12]
+
+output_dir: outputs/train/smolvla_top_long
+batch_size: 8
+steps: 80000
+save_freq: 2000
+log_freq: 1000
+
+wandb:
+  enable: true
+  project: lehome-challenge

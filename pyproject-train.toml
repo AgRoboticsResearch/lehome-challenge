@@ -1,0 +1,31 @@
+[project]
+name = "lehome"
+version = "0.1.0"
+description = "LeHome Challenge - Training only (no Isaac Sim)"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "lerobot==0.4.3",
+    "num2words>=0.5.14",
+    "open3d>=0.19.0",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "transformers>=4.57.6",
+    "transforms3d>=0.4.2",
+]
+[tool.uv]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+override-dependencies = [
+    "packaging==23.0",
+    "numpy==1.26.0",
+]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"

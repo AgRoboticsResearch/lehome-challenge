@@ -71,3 +71,8 @@ tests/
 
 # Docker history
 .isaac-lab-docker-history
+
+# Large data directories (downloaded separately)
+Assets/
+Datasets/
+third_party/

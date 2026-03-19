@@ -1,0 +1,42 @@
+dataset:
+  repo_id: repo_smolvla_pant_long
+  root: Datasets/example/pant_long_merged
+
+policy:
+  type: smolvla
+  pretrained_path: lerobot/smolvla_base
+  device: cuda
+  push_to_hub: false
+
+  train_expert_only: true
+  freeze_vision_encoder: true
+  train_state_proj: false  # 共享 state_proj，冻结不训练
+
+  input_features:
+    observation.state:
+      type: STATE
+      shape: [12]
+    observation.images.top_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.left_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.right_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [12]
+
+output_dir: outputs/train/smolvla_moe_expert_pant_long
+batch_size: 32
+steps: 20000
+save_freq: 1000
+log_freq: 100
+
+wandb:
+  enable: true
+  project: lehome-challenge
