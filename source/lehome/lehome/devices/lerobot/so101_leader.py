@@ -14,7 +14,11 @@ from .common.motors import (
 from .common.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from ..device_base import Device
 
-from lehome.assets.robots.lerobot import SO101_FOLLOWER_MOTOR_LIMITS
+from lehome.assets.robots.lerobot import (
+    SO101_FOLLOWER_MOTOR_LIMITS,
+    SO101_FOLLOWER_USD_JOINT_LIMLITS,
+)
+import numpy as np
 
 
 class SO101Leader(Device):
@@ -65,6 +69,7 @@ class SO101Leader(Device):
         self._display_controls()
         self.b_disable = False
         self.other_key_enable = False
+        self._manual_control_enabled = True  # Initially True = human can move leader
 
     def __str__(self) -> str:
         """Returns: A string containing the information of so101 leader."""
@@ -186,9 +191,117 @@ class SO101Leader(Device):
 
     def configure(self) -> None:
         self._bus.disable_torque()
+        self._manual_control_enabled = True  # Track that manual control is enabled
         self._bus.configure_motors()
         for motor in self._bus.motors:
             self._bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+
+    def set_manual_control(self, enabled: bool) -> None:
+        """Toggle manual/policy control mode.
+
+        Args:
+            enabled: If True, disable torque (human moves leader).
+                    If False, enable torque (policy takes control).
+        """
+        if enabled:
+            # Enable manual control (human moves leader)
+            if not self._manual_control_enabled:
+                self._bus.disable_torque()
+                self._manual_control_enabled = True
+        else:
+            # Enable policy control (policy commands leader)
+            if self._manual_control_enabled:
+                try:
+                    self._bus.enable_torque()
+                    self._manual_control_enabled = False
+                except Exception as e:
+                    # Fallback: enable motors individually
+                    for motor_name in self._bus.motors:
+                        try:
+                            self._bus.write("Torque_Enable", motor_name, 1)
+                        except Exception:
+                            pass
+                    # Consider it enabled even if some motors failed
+                    self._manual_control_enabled = False
+
+    def send_feedback(self, action: np.ndarray, verbose: bool = False) -> None:
+        """Send policy action to leader motors (inverse of reading from leader).
+
+        This mirrors the read path:
+        - READ:  sync_read("Present_Position") → _normalize() → convert_action_from_so101_leader() → sim
+        - WRITE: policy → send_feedback() → sync_write("Goal_Position") → hardware
+
+        Uses calibration data to match the READ path, ensuring commands stay within
+        the actual usable range of your specific hardware.
+
+        Args:
+            action: Joint positions in RADIANS (same format as policy outputs), shape (6,)
+            verbose: If True, print conversion details for debugging
+        """
+        motor_values = {}
+        joint_names = ["shoulder_pan", "shoulder_lift", "elbow_flex",
+                       "wrist_flex", "wrist_roll", "gripper"]
+
+        for i, name in enumerate(joint_names):
+            # Step 1: RADIANS → Degrees
+            degrees = action[i] * 180.0 / np.pi
+
+            # Step 2: Convert degrees to normalized motor value (using theoretical limits first)
+            joint_range = SO101_FOLLOWER_USD_JOINT_LIMLITS[name]   # USD joint limits (degrees)
+            motor_range = self._motor_limits[name]                  # Theoretical motor limits (normalized)
+
+            # This is the INVERSE of convert_action_from_so101_leader()
+            motor_val_theoretical = (
+                (degrees - joint_range[0]) / (joint_range[1] - joint_range[0])
+                * (motor_range[1] - motor_range[0]) + motor_range[0]
+            )
+
+            # Step 3: Clip to CALIBRATED range if available (matches READ behavior)
+            if name in self._bus.calibration:
+                cal = self._bus.calibration[name]
+                motor = self._bus.motors[name]
+
+                # Convert calibrated raw range to normalized (same as _normalize() does)
+                if motor.norm_mode.name == "RANGE_0_100":
+                    # Gripper: 0 to 100 scale
+                    # Raw (0-4095) → Normalized (0-100)
+                    cal_min_norm = (cal.range_min / 4095.0) * 100.0
+                    cal_max_norm = (cal.range_max / 4095.0) * 100.0
+                elif motor.norm_mode.name == "RANGE_M100_100":
+                    # Other joints: -100 to 100 scale
+                    # Raw (0-4095) → Normalized (-100 to 100)
+                    # Center is 2048 (half of 4095)
+                    cal_min_norm = ((cal.range_min - 2048.0) / 2048.0) * 100.0
+                    cal_max_norm = ((cal.range_max - 2048.0) / 2048.0) * 100.0
+                else:
+                    # Fallback to theoretical if unknown norm mode
+                    cal_min_norm = motor_range[0]
+                    cal_max_norm = motor_range[1]
+
+                # Clip to calibrated range
+                motor_val_clipped = float(np.clip(motor_val_theoretical, cal_min_norm, cal_max_norm))
+                motor_values[name] = motor_val_clipped
+
+                if verbose:
+                    clipped = motor_val_clipped != motor_val_theoretical
+                    print(f"  {name}: {degrees:.1f}° → {motor_val_theoretical:.1f} → clipped to {motor_val_clipped:.1f} (range: {cal_min_norm:.1f} to {cal_max_norm:.1f}) {'✓' if not clipped else 'CLIPPED'}")
+            else:
+                # No calibration available, use theoretical limits
+                motor_values[name] = float(np.clip(motor_val_theoretical, *motor_range))
+
+                if verbose:
+                    print(f"  {name}: {degrees:.1f}° → {motor_values[name]:.1f} (no calibration, range: {motor_range})")
+
+        if verbose:
+            print(f"Sending to leader: {motor_values}")
+
+        # TEMPORARY: Skip motor 4 (wrist_flex) if it has communication issues
+        # motor_values.pop("wrist_flex", None)
+
+        # Switch to policy control mode (enables torque only once, on first call)
+        self.set_manual_control(False)
+
+        self._bus.sync_write("Goal_Position", motor_values)
 
     def calibrate(self):
         self._bus = FeetechMotorsBus(

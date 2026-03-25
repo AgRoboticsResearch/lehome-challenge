@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import numpy as np
 
 from .so101_leader import SO101Leader
 from ..device_base import Device
@@ -59,3 +60,23 @@ class BiSO101Leader(Device):
             'right_arm': self.right_so101_leader.motor_limits
         }
         return ac_dict
+
+    def send_feedback(self, action: np.ndarray, verbose: bool = False) -> None:
+        """Send policy action to both leader arms.
+
+        Args:
+            action: Joint positions in RADIANS, shape (12,)
+                     First 6 elements = left arm, last 6 = right arm
+            verbose: If True, print conversion details for debugging
+        """
+        # Split action for left and right arms
+        left_action = action[:6]
+        right_action = action[6:]
+
+        # Send to both leaders (each handles its own conversion)
+        if verbose:
+            print("Left arm:")
+        self.left_so101_leader.send_feedback(left_action, verbose=verbose)
+        if verbose:
+            print("Right arm:")
+        self.right_so101_leader.send_feedback(right_action, verbose=verbose)

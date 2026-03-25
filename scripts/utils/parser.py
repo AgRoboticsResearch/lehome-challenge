@@ -382,6 +382,38 @@ def setup_eval_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--step_hz", type=int, default=120, help="Environment stepping rate in Hz."
     )
+    # Teleoperation Device arguments (for policy sync)
+    parser.add_argument(
+        "--teleop_device",
+        type=str,
+        default="keyboard",
+        choices=["keyboard", "bi-keyboard", "so101leader", "bi-so101leader"],
+        help="Device for policy sync to physical leader arms.",
+    )
+    parser.add_argument(
+        "--port",
+        type=str,
+        default="/dev/ttyACM0",
+        help="Port for SO101 leader (single-arm), default is /dev/ttyACM0.",
+    )
+    parser.add_argument(
+        "--left_arm_port",
+        type=str,
+        default="/dev/ttyACM0",
+        help="Port for left SO101 leader (dual-arm), default is /dev/ttyACM0.",
+    )
+    parser.add_argument(
+        "--right_arm_port",
+        type=str,
+        default="/dev/ttyACM1",
+        help="Port for right SO101 leader (dual-arm), default is /dev/ttyACM1.",
+    )
+    parser.add_argument(
+        "--recalibrate",
+        action="store_true",
+        default=False,
+        help="Recalibrate SO101 leader devices before use.",
+    )
     # Evaluation parameters
     parser.add_argument(
         "--use_random_seed",
@@ -433,7 +465,14 @@ def setup_eval_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--save_datasets",
         action="store_true",
-        help="If set, save evaluation episodes dataset(only success).",
+        help="If set, save evaluation episodes as dataset.",
+    )
+    parser.add_argument(
+        "--save_mode",
+        type=str,
+        choices=["success", "failure", "both", "all"],
+        default="success",
+        help="Dataset save mode: 'success' (only successful episodes), 'failure' (only failed episodes), 'both' (separate datasets for success and failure), 'all' (all episodes in one dataset)",
     )
     parser.add_argument(
         "--eval_dataset_path",
@@ -475,6 +514,25 @@ def setup_eval_parser() -> argparse.ArgumentParser:
         type=str,
         default="Assets/robots/so101_new_calib.urdf",
         help="URDF path for IK solver (required when --use_ee_pose is set).",
+    )
+
+    # HIL (Human-in-the-Loop) arguments
+    parser.add_argument(
+        "--enable_hil",
+        action="store_true",
+        help="Enable Human-in-the-Loop evaluation with keyboard intervention.",
+    )
+
+    # Policy Sync (Leader Feedback) arguments
+    parser.add_argument(
+        "--enable_policy_sync",
+        action="store_true",
+        help="Enable policy synchronization to physical leader arms (leader moves with policy for tactile feedback). Requires --teleop_device to be set to 'so101leader' or 'bi-so101leader'.",
+    )
+    parser.add_argument(
+        "--policy_sync_verbose",
+        action="store_true",
+        help="Enable verbose logging for policy synchronization (prints conversion details for debugging).",
     )
 
     return parser

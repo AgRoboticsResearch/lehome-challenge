@@ -26,6 +26,7 @@ from lehome.utils.record import (
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from .common import stabilize_garment_after_reset
 from lehome.utils.logger import get_logger
+from scripts.utils.dataset_record import create_teleop_interface
 
 logger = get_logger(__name__)
 
@@ -43,11 +44,58 @@ def run_evaluation_loop(
     Refactored to be agnostic of specific model implementations.
     """
 
+    # --- HIL Keyboard Handler Setup (Optional) ---
+    hil_handler = None
+    if args.enable_hil:
+        from scripts.utils.hil_keyboard import HILKeyboardHandler
+
+        hil_handler = HILKeyboardHandler()
+        hil_handler.start()
+        logger.info("HIL mode enabled. Press 'i' to toggle intervention mode.")
+        logger.info("  Mode starts in POLICY (automatic) mode")
+
+    # --- Policy Sync: Leader Device Setup (Optional) ---
+    leader_device = None
+    if getattr(args, 'enable_policy_sync', False):
+        # Check if teleop device type is compatible
+        if hasattr(args, 'teleop_device') and args.teleop_device in ['bi-so101leader', 'so101leader']:
+            try:
+                leader_device = create_teleop_interface(env, args)
+                logger.info(f"✅ Leader device created for policy sync: {args.teleop_device}")
+            except Exception as e:
+                logger.error(f"❌ Failed to create leader device: {e}")
+                logger.warning("Continuing with sim-only execution (no leader feedback)")
+                leader_device = None
+        else:
+            logger.warning(f"⚠️  Policy sync requires SO101 leader device")
+            logger.warning(f"   Current device: {getattr(args, 'teleop_device', None)}")
+            logger.warning("   Supported: bi-so101leader, so101leader")
+
     # --- Dataset Recording Setup (Optional) ---
     eval_dataset = None
+    eval_dataset_success = None
+    eval_dataset_failure = None
     json_path = None
+    json_path_success = None
+    json_path_failure = None
     episode_index = 0
+    episode_index_success = 0
+    episode_index_failure = 0
+
     if args.save_datasets:
+        # Determine joint names and dimension (needed for complementary_info)
+        action_names = [
+            "shoulder_pan", "shoulder_lift", "elbow_flex",
+            "wrist_flex", "wrist_roll", "gripper",
+        ]
+        if is_bimanual:
+            left_names = [f"left_{n}" for n in action_names]
+            right_names = [f"right_{n}" for n in action_names]
+            joint_names = left_names + right_names
+        else:
+            joint_names = action_names
+        dim = len(joint_names)
+
         features = None
         if args.dataset_root and Path(args.dataset_root).exists():
             source_dataset = LeRobotDataset(repo_id="collected_dataset", root=Path(args.dataset_root))
@@ -55,17 +103,6 @@ def run_evaluation_loop(
             fps = source_dataset.fps
         else:
             fps = 30  # Default FPS if no source dataset is provided
-            action_names = [
-                "shoulder_pan", "shoulder_lift", "elbow_flex",
-                "wrist_flex", "wrist_roll", "gripper",
-            ]
-            if is_bimanual:
-                left_names = [f"left_{n}" for n in action_names]
-                right_names = [f"right_{n}" for n in action_names]
-                joint_names = left_names + right_names
-            else:
-                joint_names = action_names
-            dim = len(joint_names)
             features = {
                 "observation.state": {
                     "dtype": "float32",
@@ -85,17 +122,67 @@ def run_evaluation_loop(
                     "shape": (480, 640, 3),
                     "names": ["height", "width", "channels"],
                 }
+
+        # Add Evo-RL complementary_info fields for HIL workflow
+        # State codes: 0.0 = POLICY, 1.0 = ACTIVE (intervention), 2.0 = RELEASE
+        features["complementary_info.policy_action"] = {
+            "dtype": "float32",
+            "shape": (dim,),
+            "names": joint_names,
+        }
+        features["complementary_info.is_intervention"] = {
+            "dtype": "float32",
+            "shape": (1,),
+        }
+        features["complementary_info.state"] = {
+            "dtype": "float32",
+            "shape": (1,),
+        }
+        features["complementary_info.collector_policy_id"] = {
+            "dtype": "string",
+            "shape": (1,),
+        }
+
         root_path = Path(args.eval_dataset_path)
-        eval_dataset = LeRobotDataset.create(
-            repo_id="lehome_eval",
-            fps=fps,
-            root=get_next_experiment_path_with_gap(root_path),
-            use_videos=True,
-            image_writer_threads=8,
-            image_writer_processes=0,
-            features=features,
-        )
-        json_path = eval_dataset.root / "meta" / "garment_info.json"
+        save_mode = args.save_mode
+
+        if save_mode == "both":
+            # Create two separate datasets for success and failure
+            success_path = get_next_experiment_path_with_gap(root_path / "success")
+            failure_path = get_next_experiment_path_with_gap(root_path / "failure")
+
+            eval_dataset_success = LeRobotDataset.create(
+                repo_id="lehome_eval_success",
+                fps=fps,
+                root=success_path,
+                use_videos=True,
+                image_writer_threads=8,
+                image_writer_processes=0,
+                features=features,
+            )
+            eval_dataset_failure = LeRobotDataset.create(
+                repo_id="lehome_eval_failure",
+                fps=fps,
+                root=failure_path,
+                use_videos=True,
+                image_writer_threads=8,
+                image_writer_processes=0,
+                features=features,
+            )
+            json_path_success = eval_dataset_success.root / "meta" / "garment_info.json"
+            json_path_failure = eval_dataset_failure.root / "meta" / "garment_info.json"
+        else:
+            # Create single dataset for all modes except "both"
+            eval_dataset = LeRobotDataset.create(
+                repo_id="lehome_eval",
+                fps=fps,
+                root=get_next_experiment_path_with_gap(root_path),
+                use_videos=True,
+                image_writer_threads=8,
+                image_writer_processes=0,
+                features=features,
+            )
+            json_path = eval_dataset.root / "meta" / "garment_info.json"
 
     all_episode_metrics = []
     logger.info(f"Starting evaluation: {args.num_episodes} episodes")
@@ -124,13 +211,53 @@ def run_evaluation_loop(
         success_flag = False
         success = torch.tensor(False)
 
+        # Track policy actions and interventions for Evo-RL complementary_info
+        policy_actions = []
+        is_interventions = []
+        last_policy_action = None
+
+        # Track if at least one frame has been recorded (for quit handling)
+        frames_recorded_this_episode = False
+
         for st in range(args.max_steps):
             if rate_limiter:
                 rate_limiter.sleep(env)
 
+            # HIL: Poll for keyboard input
+            if hil_handler:
+                hil_handler.poll()
+
+                # Check for quit request (only after at least one frame is recorded)
+                if hil_handler.is_quit_requested() and frames_recorded_this_episode:
+                    logger.info("[HIL] Quit requested by user. Ending episode early...")
+                    break
+                elif hil_handler.is_quit_requested() and not frames_recorded_this_episode:
+                    # Quit requested but no frames yet - wait for at least one frame
+                    logger.info("[HIL] Quit requested but no frames yet. Waiting for first frame...")
+
+                # Log mode change if toggled
+                if hil_handler.is_intervention_toggled():
+                    mode = "HUMAN" if hil_handler.is_intervention_active() else "POLICY"
+                    logger.info(f"[HIL] Mode switched to: {mode}")
+                    hil_handler.reset_toggle()
+
             # 3. Policy Inference (The core abstraction)
             # Input: Numpy Dict -> Output: Numpy Array
             action_np = policy.select_action(observation_dict)
+            last_policy_action = action_np.copy()  # Store for complementary_info
+
+            # Check if in intervention mode (HIL: human control)
+            is_intervention = False
+            if hil_handler:
+                is_intervention = hil_handler.is_intervention_active()
+                if is_intervention:
+                    # In intervention mode, action will come from SO101 leader (future)
+                    # For now, still use policy action but mark as intervention
+                    pass
+
+            # Track for complementary_info
+            policy_actions.append(last_policy_action)
+            is_interventions.append(is_intervention)
 
             # 4. Prepare Action for Environment (Tensor)
             # Convert numpy action to tensor for Isaac Lab
@@ -155,6 +282,18 @@ def run_evaluation_loop(
 
             # 6. Step Environment
             env.step(action)
+
+            # 7. Send action to leader for tactile feedback (if enabled)
+            if leader_device is not None:
+                action_np = action.cpu().numpy().squeeze()
+                # Verbose mode: only for first 10 steps to avoid spam
+                verbose = getattr(args, 'policy_sync_verbose', False) and st < 10
+                try:
+                    leader_device.send_feedback(action_np, verbose=verbose)
+                except Exception as e:
+                    logger.warning(f"⚠️  Leader feedback failed on step {st}: {e}")
+                    logger.warning("Disabling leader feedback for remainder of episode")
+                    leader_device = None  # Disable further attempts
 
             # Check success first
             if not success_flag:
@@ -186,8 +325,48 @@ def run_evaluation_loop(
                     for k, v in observation_dict.items()
                     if k != "observation.top_depth"
                 }
+                # Add task field (required by validate_frame, but not stored in data files)
                 frame["task"] = args.task_description
-                eval_dataset.add_frame(frame)
+
+                # Add Evo-RL complementary_info fields
+                # State codes: 0.0 = POLICY, 1.0 = ACTIVE (intervention)
+                # Use step index to get corresponding policy action
+                step_idx = len(policy_actions) - 1 if policy_actions else 0
+                if step_idx < len(policy_actions):
+                    frame["complementary_info.policy_action"] = policy_actions[step_idx]
+                    is_int_val = 1.0 if is_interventions[step_idx] else 0.0
+                    frame["complementary_info.is_intervention"] = np.array([is_int_val], dtype=np.float32)
+                    state_val = 1.0 if is_interventions[step_idx] else 0.0  # ACTIVE or POLICY
+                    frame["complementary_info.state"] = np.array([state_val], dtype=np.float32)
+                    # Determine collector policy ID for this episode
+                    # Will be updated at end if any intervention occurred
+                    frame["complementary_info.collector_policy_id"] = "policy"
+
+                # Determine which dataset(s) to record to based on save_mode
+                save_mode = args.save_mode
+                if save_mode == "both":
+                    # In "both" mode, we record to both datasets during the episode
+                    # and decide which one to save at the end based on success/failure
+                    # NOTE: LeRobot's add_frame() pops "task" from the frame, so we need to re-add it
+                    try:
+                        eval_dataset_success.add_frame(frame)
+                        frame["task"] = args.task_description  # Re-add after pop
+                        eval_dataset_failure.add_frame(frame)
+                        frames_recorded_this_episode = True
+                    except Exception as e:
+                        logger.error(f"Error adding frame to dataset: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    # For other modes, record to the single dataset
+                    # We'll filter episodes when saving
+                    try:
+                        eval_dataset.add_frame(frame)
+                        frames_recorded_this_episode = True
+                    except Exception as e:
+                        logger.error(f"Error adding frame to dataset: {e}")
+                        import traceback
+                        traceback.print_exc()
 
             if args.save_video:
                 for key, val in observation_dict.items():
@@ -200,21 +379,181 @@ def run_evaluation_loop(
                     break
 
         # --- End of Episode Handling ---
-        is_success = success.item() if success_flag else False
+        # Check if manual label was provided via keyboard (HIL mode)
+        manual_label = None
+        if hil_handler:
+            manual_label = hil_handler.get_episode_label()
 
-        # Save Datasets
+        # Determine episode success: manual label (HIL) > environment flag
+        if manual_label:
+            # HIL mode: user manually labeled the episode
+            episode_success_value = manual_label
+            is_success = (manual_label == "success")
+        else:
+            # Auto mode: use environment's success flag
+            is_success = success.item() if success_flag else False
+            episode_success_value = "success" if is_success else "failure"
+
+        # Determine collector_policy_id based on whether any intervention occurred
+        had_intervention = any(is_interventions) if is_interventions else False
+        collector_policy_id = "human" if had_intervention else "policy"
+
+        # Save Datasets based on save_mode
         if args.save_datasets:
-            if success_flag:
-                eval_dataset.save_episode()
-                append_episode_initial_pose(
-                    json_path,
-                    episode_index,
-                    object_initial_pose,
-                    garment_name=garment_name,
-                )
-                episode_index += 1
-            else:
-                eval_dataset.clear_episode_buffer()
+            save_mode = args.save_mode
+
+            # Check if we have any frames to save (can happen if quit before first frame)
+            has_frames = len(policy_actions) > 0
+            if not has_frames:
+                logger.warning(f"[HIL] No frames recorded for episode {i+1}, skipping save. "
+                             f"(Did you press 'q' during episode reset?)")
+                continue
+
+            # Debug: Log frame count before saving
+            logger.info(f"[HIL] Episode {i+1}: Attempting to save with {len(policy_actions)} frames")
+
+            if save_mode == "success":
+                # Only save successful episodes
+                if is_success:
+                    extra_episode_metadata = {
+                        "episode_success": episode_success_value,
+                    }
+                    try:
+                        eval_dataset.save_episode(extra_episode_metadata=extra_episode_metadata)
+                        logger.info(f"[HIL] Episode {i+1} saved successfully (success)")
+                        append_episode_initial_pose(
+                            json_path,
+                            episode_index,
+                            object_initial_pose,
+                            garment_name=garment_name,
+                        )
+                        episode_index += 1
+                    except Exception as e:
+                        logger.error(f"[HIL] Error saving episode {i+1}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        try:
+                            eval_dataset.clear_episode_buffer()
+                        except:
+                            pass
+                else:
+                    # Clear the buffer for failed episodes
+                    try:
+                        eval_dataset.clear_episode_buffer()
+                    except:
+                        pass
+
+            elif save_mode == "failure":
+                # Only save failed episodes
+                if not is_success:
+                    extra_episode_metadata = {
+                        "episode_success": episode_success_value,
+                    }
+                    try:
+                        eval_dataset.save_episode(extra_episode_metadata=extra_episode_metadata)
+                        logger.info(f"[HIL] Episode {i+1} saved successfully (failure)")
+                        append_episode_initial_pose(
+                            json_path,
+                            episode_index,
+                            object_initial_pose,
+                            garment_name=garment_name,
+                        )
+                        episode_index += 1
+                    except Exception as e:
+                        logger.error(f"[HIL] Error saving episode {i+1}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        try:
+                            eval_dataset.clear_episode_buffer()
+                        except:
+                            pass
+                else:
+                    # Clear the buffer for successful episodes
+                    try:
+                        eval_dataset.clear_episode_buffer()
+                    except:
+                        pass
+
+            elif save_mode == "both":
+                # Save to appropriate dataset based on outcome
+                extra_episode_metadata = {
+                    "episode_success": episode_success_value,
+                }
+                if is_success:
+                    try:
+                        eval_dataset_success.save_episode(extra_episode_metadata=extra_episode_metadata)
+                        logger.info(f"[HIL] Episode {i+1} saved successfully (success)")
+                        append_episode_initial_pose(
+                            json_path_success,
+                            episode_index_success,
+                            object_initial_pose,
+                            garment_name=garment_name,
+                        )
+                        episode_index_success += 1
+                        # Clear failure buffer
+                        try:
+                            eval_dataset_failure.clear_episode_buffer()
+                        except:
+                            pass
+                    except Exception as e:
+                        logger.error(f"[HIL] Error saving episode {i+1}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        try:
+                            eval_dataset_success.clear_episode_buffer()
+                            eval_dataset_failure.clear_episode_buffer()
+                        except:
+                            pass
+                else:
+                    try:
+                        eval_dataset_failure.save_episode(extra_episode_metadata=extra_episode_metadata)
+                        logger.info(f"[HIL] Episode {i+1} saved successfully (failure)")
+                        append_episode_initial_pose(
+                            json_path_failure,
+                            episode_index_failure,
+                            object_initial_pose,
+                            garment_name=garment_name,
+                        )
+                        episode_index_failure += 1
+                        # Clear success buffer
+                        try:
+                            eval_dataset_success.clear_episode_buffer()
+                        except:
+                            pass
+                    except Exception as e:
+                        logger.error(f"[HIL] Error saving episode {i+1}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        try:
+                            eval_dataset_success.clear_episode_buffer()
+                            eval_dataset_failure.clear_episode_buffer()
+                        except:
+                            pass
+
+            elif save_mode == "all":
+                # Save all episodes
+                extra_episode_metadata = {
+                    "episode_success": episode_success_value,
+                }
+                try:
+                    eval_dataset.save_episode(extra_episode_metadata=extra_episode_metadata)
+                    logger.info(f"[HIL] Episode {i+1} saved successfully")
+                    append_episode_initial_pose(
+                        json_path,
+                        episode_index,
+                        object_initial_pose,
+                        garment_name=garment_name,
+                    )
+                    episode_index += 1
+                except Exception as e:
+                    logger.error(f"[HIL] Error saving episode {i+1}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Clear the buffer to prevent issues with next episode
+                    try:
+                        eval_dataset.clear_episode_buffer()
+                    except:
+                        pass
 
         # Save Videos (Using generic util)
         if args.save_video:
@@ -229,11 +568,38 @@ def run_evaluation_loop(
         all_episode_metrics.append(
             {"return": episode_return, "length": episode_length, "success": is_success}
         )
+
+        # Add HIL mode indicator to log
+        mode_str = ""
+        if hil_handler:
+            mode_str = f" [HIL: {'HUMAN' if hil_handler.is_intervention_active() else 'POLICY'}]"
+
         logger.info(
-            f"Episode {i + 1}/{args.num_episodes}: Return={episode_return:.2f}, Length={episode_length}, Success={is_success}"
+            f"Episode {i + 1}/{args.num_episodes}: Return={episode_return:.2f}, Length={episode_length}, Success={is_success}{mode_str}"
         )
 
-    return all_episode_metrics
+    # Finalize dataset(s) to flush metadata buffers and close writers
+    if args.save_datasets:
+        save_mode = args.save_mode
+        if save_mode == "both":
+            if eval_dataset_success is not None:
+                logger.info("Finalizing success dataset...")
+                eval_dataset_success.finalize()
+            if eval_dataset_failure is not None:
+                logger.info("Finalizing failure dataset...")
+                eval_dataset_failure.finalize()
+        elif eval_dataset is not None:
+            logger.info("Finalizing dataset...")
+            eval_dataset.finalize()
+
+    # Cleanup HIL keyboard handler
+    if hil_handler:
+        hil_handler.stop()
+
+    # Check if user requested quit (for HIL mode)
+    quit_requested = hil_handler.is_quit_requested() if hil_handler else False
+
+    return all_episode_metrics, quit_requested
 
 
 def eval(args: argparse.Namespace, simulation_app: Any) -> None:
@@ -392,7 +758,7 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
                     policy.reset()
 
             # Run Loop
-            metrics = run_evaluation_loop(
+            metrics, quit_requested = run_evaluation_loop(
                 env=env,
                 policy=policy,
                 args=args,
@@ -404,6 +770,11 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
             all_garment_metrics.append(
                 {"garment_name": garment_name, "metrics": metrics}
             )
+
+            # Stop evaluation if user requested quit (HIL mode)
+            if quit_requested:
+                logger.info("[HIL] Quit requested by user. Stopping evaluation...")
+                break
 
     finally:
         env.close()
