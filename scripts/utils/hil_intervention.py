@@ -79,7 +79,7 @@ class HILInterventionManager:
 
         try:
             # Get raw action from leader
-            leader_action = self.leader_device.input_action
+            leader_action = self.leader_device.input2action()
 
             # Check if leader is started
             if not leader_action.get('started', False):
