@@ -146,9 +146,14 @@ class HILInterventionManager:
             motor_range = motor_limits.get(name, SO101_FOLLOWER_MOTOR_LIMITS[name])
             joint_range = SO101_FOLLOWER_USD_JOINT_LIMLITS[name]
 
-            # Convert motor value -> degrees
-            degrees = (motor_val - motor_range[0]) / (motor_range[1] - motor_range[0]) * \
-                       (joint_range[1] - joint_range[0]) + joint_range[0]
+            # For gripper: motor values 0-100 map directly to joint_range (-10 to 100 degrees)
+            if name == "gripper":
+                # Linear mapping: 0 -> -10 degrees, 100 -> 100 degrees
+                degrees = motor_val * (joint_range[1] - joint_range[0]) / 100.0 + joint_range[0]
+            else:
+                # For other joints, use the standard formula
+                degrees = (motor_val - motor_range[0]) / (motor_range[1] - motor_range[0]) * \
+                         (joint_range[1] - joint_range[0]) + joint_range[0]
 
             # Convert degrees -> radians
             action_rad[i] = degrees * np.pi / 180.0
