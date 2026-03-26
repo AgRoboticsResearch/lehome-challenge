@@ -21,12 +21,12 @@ class GarmentEnvCfg(DirectRLEnvCfg):
     observation_space = 12
     state_space = 0
     # simulation
-    render_cfg = sim_utils.RenderCfg(rendering_mode="quality", antialiasing_mode="FXAA")
+    render_cfg = sim_utils.RenderCfg(rendering_mode="balanced", antialiasing_mode="FXAA")
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 90,
-        render_interval=decimation,
+        dt=1 / 120,  # Faster physics for better responsiveness (8.3ms per step)
+        render_interval=decimation,  # Render every physics step for smooth visuals
         render=render_cfg,
-        use_fabric=False,
+        use_fabric=True,
     )
     # garment_name (str): Garment name in the format "Type_Length_Seen/Unseen_Index",
     # e.g., "Top_Long_Unseen_0", "Top_Short_Seen_1",
@@ -90,7 +90,7 @@ class GarmentEnvCfg(DirectRLEnvCfg):
         ),
         width=640,
         height=480,
-        update_period=1 / 30.0,  # 30FPS
+        update_period=1 / 30.0,  # 30FPS for high-quality dataset recording
     )
     right_wrist: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/Robot/Right_Robot/gripper/right_wrist_camera",
@@ -109,7 +109,7 @@ class GarmentEnvCfg(DirectRLEnvCfg):
         ),
         width=640,
         height=480,
-        update_period=1 / 30.0,  # 30FPS
+        update_period=1 / 30.0,  # 30FPS for high-quality dataset recording
     )
     top_camera: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/Robot/Right_Robot/base/top_camera",
@@ -123,6 +123,78 @@ class GarmentEnvCfg(DirectRLEnvCfg):
             focal_length=28.7,
             focus_distance=400.0,
             horizontal_aperture=38.11,  # For a 78° FOV (assuming square image)
+            clipping_range=(0.01, 50.0),
+            lock_camera=True,
+        ),
+        width=640,
+        height=480,
+    )
+    left_side_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/Cameras/Left_Side_View",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(-0.32874, -0.17899, 0.61484),
+            rot=(0.77174, 0.55257, -0.1628, -0.26941),  # wxyz - normalized quaternion
+            convention="opengl",
+        ),  # xwzy
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=36.0,  # For a ~75° FOV
+            clipping_range=(0.01, 50.0),
+            lock_camera=True,
+        ),
+        width=640,
+        height=480,
+    )
+    right_side_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/Cameras/Right_Side_View",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(0.2571, -0.13028, 0.5994),
+            rot=(0.81141, 0.50518, 0.12366, 0.26667),  # wxyz - normalized quaternion
+            convention="opengl",
+        ),  # xwzy
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=36.0,  # For a ~75° FOV
+            clipping_range=(0.01, 50.0),
+            lock_camera=True,
+        ),
+        width=640,
+        height=480,
+    )
+    left_bot_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/Cameras/Left_Bot_View",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(-0.19034, -0.21539, 0.63653),  # TODO: Tune position
+            rot=(0.88838, 0.45893, -0.00943, 0.00876),  # TODO: Tune rotation (identity = no rotation)
+            convention="opengl",
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=36.0,  # For a ~75° FOV
+            clipping_range=(0.01, 50.0),
+            lock_camera=True,
+        ),
+        width=640,
+        height=480,
+    )
+    right_bot_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/Cameras/Right_Bot_View",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(0.09391, -0.24474, 0.62588),  # TODO: Tune position
+            rot=(0.84521, 0.53443, 0.0, 0.0),  # TODO: Tune rotation (identity = no rotation)
+            convention="opengl",
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=36.0,  # For a ~75° FOV
             clipping_range=(0.01, 50.0),
             lock_camera=True,
         ),

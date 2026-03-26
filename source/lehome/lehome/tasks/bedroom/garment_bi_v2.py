@@ -16,6 +16,7 @@ from pxr import UsdShade, Sdf, UsdGeom
 import omni.kit.commands
 from isaacsim.core.utils.prims import is_prim_path_valid
 import isaacsim.core.utils.prims as prims_utils
+from isaacsim.core.utils.viewports import create_viewport_for_camera
 
 from lehome.tasks.bedroom.garment_bi_cfg_v2 import GarmentEnvCfg
 from lehome.utils.success_checker_chanllege import success_checker_garment_fold
@@ -56,12 +57,19 @@ class GarmentEnv(DirectRLEnv):
             self.garment_rng = np.random.RandomState(cfg.random_seed)
 
         cfg.viewer = cfg.viewer.replace(
-            eye=(0, -1.2, 1.3),
-            lookat=(0, 6.4, -2.8),
+            eye=(0, -0.1, 1.5),
+            lookat=(0, 0.5, -2.8),
         )
         super().__init__(cfg, render_mode, **kwargs)
         self.left_joint_pos = self.left_arm.data.joint_pos
         self.right_joint_pos = self.right_arm.data.joint_pos
+
+        # Setup multi-viewport for side and bot cameras (only if not headless)
+        self.left_side_viewport = None
+        self.right_side_viewport = None
+        self.left_bot_viewport = None
+        self.right_bot_viewport = None
+        self._setup_multi_viewport()
 
     def _setup_scene(self):
         self.left_arm = Articulation(self.cfg.left_robot)
@@ -69,6 +77,10 @@ class GarmentEnv(DirectRLEnv):
         self.top_camera = TiledCamera(self.cfg.top_camera)
         self.left_camera = TiledCamera(self.cfg.left_wrist)
         self.right_camera = TiledCamera(self.cfg.right_wrist)
+        self.left_side_camera = TiledCamera(self.cfg.left_side_camera)
+        self.right_side_camera = TiledCamera(self.cfg.right_side_camera)
+        self.left_bot_camera = TiledCamera(self.cfg.left_bot_camera)
+        self.right_bot_camera = TiledCamera(self.cfg.right_bot_camera)
         cfg = sim_utils.UsdFileCfg(usd_path=f"{MARBLE_BEDROOM_USD_PATH}")
         cfg.func(
             "/World/Scene",
@@ -86,9 +98,113 @@ class GarmentEnv(DirectRLEnv):
         self.scene.sensors["top_camera"] = self.top_camera
         self.scene.sensors["left_camera"] = self.left_camera
         self.scene.sensors["right_camera"] = self.right_camera
+        self.scene.sensors["left_side_camera"] = self.left_side_camera
+        self.scene.sensors["right_side_camera"] = self.right_side_camera
+        self.scene.sensors["left_bot_camera"] = self.left_bot_camera
+        self.scene.sensors["right_bot_camera"] = self.right_bot_camera
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=1200, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+    def _setup_multi_viewport(self):
+        """Create additional viewports for side and bot cameras.
+
+        This creates separate viewport windows for the side and bottom cameras,
+        allowing real-time visualization during teleoperation alongside the main 3D scene view.
+        """
+        try:
+            import omni.kit.app
+            app = omni.kit.app.get_app()
+
+            # Check if running in headless mode - skip viewport creation if so
+            if hasattr(app, 'is_headless') and app.is_headless():
+                logger.debug("[GarmentEnv] Headless mode detected, skipping multi-viewport setup")
+                return
+
+            # Get screen dimensions for positioning
+            try:
+                import carb.settings
+                settings = carb.settings.get_settings()
+                screen_width = settings.get("/app/windowing/width") or 1920
+                screen_height = settings.get("/app/windowing/height") or 1080
+            except:
+                screen_width = 1920
+                screen_height = 1080
+
+            # Calculate viewport positions (tile them horizontally)
+            viewport_width = 640
+            viewport_height = 480
+
+            # Row 1: Side cameras
+            left_pos_x = 50
+            left_pos_y = 50
+            right_pos_x = left_pos_x + viewport_width + 20
+            right_pos_y = 50
+
+            # Create left side camera viewport
+            logger.debug("[GarmentEnv] Creating viewport for left side camera...")
+            self.left_side_viewport = create_viewport_for_camera(
+                viewport_name="Left Side View",
+                camera_prim_path="/World/Cameras/Left_Side_View",
+                width=viewport_width,
+                height=viewport_height,
+                position_x=left_pos_x,
+                position_y=left_pos_y,
+            )
+
+            # Create right side camera viewport
+            logger.debug("[GarmentEnv] Creating viewport for right side camera...")
+            self.right_side_viewport = create_viewport_for_camera(
+                viewport_name="Right Side View",
+                camera_prim_path="/World/Cameras/Right_Side_View",
+                width=viewport_width,
+                height=viewport_height,
+                position_x=right_pos_x,
+                position_y=right_pos_y,
+            )
+
+            # Row 2: Bot cameras
+            left_bot_y = left_pos_y + viewport_height + 20
+            right_bot_y = left_bot_y
+
+            # Create left bot camera viewport
+            logger.debug("[GarmentEnv] Creating viewport for left bot camera...")
+            self.left_bot_viewport = create_viewport_for_camera(
+                viewport_name="Left Bot View",
+                camera_prim_path="/World/Cameras/Left_Bot_View",
+                width=viewport_width,
+                height=viewport_height,
+                position_x=left_pos_x,
+                position_y=left_bot_y,
+            )
+
+            # Create right bot camera viewport
+            logger.debug("[GarmentEnv] Creating viewport for right bot camera...")
+            self.right_bot_viewport = create_viewport_for_camera(
+                viewport_name="Right Bot View",
+                camera_prim_path="/World/Cameras/Right_Bot_View",
+                width=viewport_width,
+                height=viewport_height,
+                position_x=right_pos_x,
+                position_y=right_bot_y,
+            )
+
+            logger.info(
+                "[GarmentEnv] Multi-viewport setup complete: "
+                f"Left side view ({left_pos_x},{left_pos_y}), "
+                f"Right side view ({right_pos_x},{right_pos_y}), "
+                f"Left bot view ({left_pos_x},{left_bot_y}), "
+                f"Right bot view ({right_pos_x},{right_bot_y})"
+            )
+
+        except ImportError as e:
+            logger.warning(f"[GarmentEnv] Could not import viewport utilities: {e}")
+        except Exception as e:
+            logger.warning(f"[GarmentEnv] Failed to create multi-viewport: {e}")
+            self.left_side_viewport = None
+            self.right_side_viewport = None
+            self.left_bot_viewport = None
+            self.right_bot_viewport = None
 
     def _create_garment_object(self):
         """
@@ -755,8 +871,49 @@ class GarmentEnv(DirectRLEnv):
     def __del__(self):
         """Destructor to ensure cleanup on deletion."""
         try:
+            # Clean up multi-viewport windows
+            self._cleanup_viewports()
+        except Exception:
+            # Ignore errors during viewport cleanup
+            pass
+
+        try:
             if hasattr(self, "object") and self.object is not None:
                 self.cleanup()
         except Exception:
             # Ignore errors during destruction
             pass
+
+    def _cleanup_viewports(self):
+        """Clean up viewport windows created for side and bot cameras."""
+        try:
+            if hasattr(self, 'left_side_viewport') and self.left_side_viewport is not None:
+                self.left_side_viewport.destroy()
+                self.left_side_viewport = None
+                logger.debug("[GarmentEnv] Left side viewport destroyed")
+        except Exception as e:
+            logger.debug(f"[GarmentEnv] Error destroying left side viewport: {e}")
+
+        try:
+            if hasattr(self, 'right_side_viewport') and self.right_side_viewport is not None:
+                self.right_side_viewport.destroy()
+                self.right_side_viewport = None
+                logger.debug("[GarmentEnv] Right side viewport destroyed")
+        except Exception as e:
+            logger.debug(f"[GarmentEnv] Error destroying right side viewport: {e}")
+
+        try:
+            if hasattr(self, 'left_bot_viewport') and self.left_bot_viewport is not None:
+                self.left_bot_viewport.destroy()
+                self.left_bot_viewport = None
+                logger.debug("[GarmentEnv] Left bot viewport destroyed")
+        except Exception as e:
+            logger.debug(f"[GarmentEnv] Error destroying left bot viewport: {e}")
+
+        try:
+            if hasattr(self, 'right_bot_viewport') and self.right_bot_viewport is not None:
+                self.right_bot_viewport.destroy()
+                self.right_bot_viewport = None
+                logger.debug("[GarmentEnv] Right bot viewport destroyed")
+        except Exception as e:
+            logger.debug(f"[GarmentEnv] Error destroying right bot viewport: {e}")

@@ -19,6 +19,9 @@ dependencies = [
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
+
+[tool.uv.extra-build-dependencies]
+flatdict = ["setuptools"]
 override-dependencies = [
     "packaging==23.0",
     "numpy==1.26.0",

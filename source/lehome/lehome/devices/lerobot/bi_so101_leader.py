@@ -80,3 +80,13 @@ class BiSO101Leader(Device):
         if verbose:
             print("Right arm:")
         self.right_so101_leader.send_feedback(right_action, verbose=verbose)
+
+    def set_manual_control(self, enabled: bool) -> None:
+        """Toggle manual/policy control mode for both arms.
+
+        Args:
+            enabled: If True, disable torque (human moves leader).
+                    If False, enable torque (policy takes control).
+        """
+        self.left_so101_leader.set_manual_control(enabled)
+        self.right_so101_leader.set_manual_control(enabled)

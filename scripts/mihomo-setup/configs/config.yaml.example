@@ -1,0 +1,96 @@
+# Mihomo (Clash Meta) Configuration Example
+# Copy this to config.yaml and customize for your needs
+
+# Mixed port for HTTP and SOCKS5 proxy
+mixed-port: 7897
+
+# Allow LAN connections (optional, set to true if you need other devices to use this proxy)
+allow-lan: false
+
+# Bind address (127.0.0.1 for localhost only, more secure)
+bind-address: 127.0.0.1
+
+# Mode: rule, global, or direct
+mode: rule
+
+# Log level: silent, error, warning, info, debug
+log-level: info
+
+# External controller for web UI (localhost only for security)
+external-controller: 127.0.0.1:9090
+
+# Optional: Secret for API authentication
+# secret: "your-secret-here"
+
+# DNS configuration
+dns:
+  enable: true
+  listen: 0.0.0.0:53
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  fallback:
+    - 8.8.8.8
+    - 1.1.1.1
+
+# GeoIP database (auto-updated)
+geox-url:
+  geoip: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
+  geosite: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"
+  mmdb: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb"
+
+# Proxy providers (add your subscription or configure proxies manually)
+proxies:
+  # Example: SOCKS5 proxy
+  # - name: "MySOCKS5"
+  #   type: socks5
+  #   server: server.example.com
+  #   port: 1080
+  #   username: user
+  #   password: pass
+
+  # Example: Shadowsocks
+  # - name: "MySS"
+  #   type: ss
+  #   server: server.example.com
+  #   port: 8388
+  #   cipher: aes-256-gcm
+  #   password: password
+
+  # Example: VMess
+  # - name: "MyVMess"
+  #   type: vmess
+  #   server: server.example.com
+  #   port: 443
+  #   uuid: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  #   alterId: 0
+  #   cipher: auto
+
+# Proxy groups (for organizing and selecting proxies)
+proxy-groups:
+  - name: "Proxy"
+    type: select
+    proxies:
+      - DIRECT
+      # Add your proxy names here, e.g.:
+      # - MySOCKS5
+      # - MySS
+
+  - name: "Auto"
+    type: url-test
+    proxies:
+      - DIRECT
+      # Add proxies for auto-selection
+    url: 'http://www.gstatic.com/generate_204'
+    interval: 300
+
+# Routing rules
+rules:
+  # Local network - direct connection
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+
+  # Default rule - use proxy group
+  - MATCH,Proxy

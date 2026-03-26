@@ -206,8 +206,28 @@ class SO101Leader(Device):
         if enabled:
             # Enable manual control (human moves leader)
             if not self._manual_control_enabled:
-                self._bus.disable_torque()
-                self._manual_control_enabled = True
+                try:
+                    self._bus.disable_torque()
+                    self._manual_control_enabled = True
+                except Exception as e:
+                    # Fallback: disable motors individually with retry
+                    print(f"[WARN] Failed to disable torque bulk: {e}")
+                    print("[INFO] Trying individual motor disable...")
+                    success = True
+                    for motor_name in self._bus.motors:
+                        for retry in range(3):
+                            try:
+                                self._bus.write("Torque_Enable", motor_name, 0)
+                                break
+                            except Exception as e2:
+                                if retry == 2:
+                                    print(f"[WARN] Failed to disable {motor_name}: {e2}")
+                                    success = False
+                                else:
+                                    import time
+                                    time.sleep(0.1)
+                    # Consider it disabled even if some motors failed
+                    self._manual_control_enabled = True
         else:
             # Enable policy control (policy commands leader)
             if self._manual_control_enabled:
@@ -216,11 +236,13 @@ class SO101Leader(Device):
                     self._manual_control_enabled = False
                 except Exception as e:
                     # Fallback: enable motors individually
+                    print(f"[WARN] Failed to enable torque bulk: {e}")
+                    print("[INFO] Trying individual motor enable...")
                     for motor_name in self._bus.motors:
                         try:
                             self._bus.write("Torque_Enable", motor_name, 1)
-                        except Exception:
-                            pass
+                        except Exception as e2:
+                            print(f"[WARN] Failed to enable {motor_name}: {e2}")
                     # Consider it enabled even if some motors failed
                     self._manual_control_enabled = False
 

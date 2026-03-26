@@ -1,0 +1,24 @@
+[Unit]
+Description=Mihomo Proxy Service
+Documentation=https://wiki.metacubex.one/
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+ExecStart=/opt/mihomo/mihomo -d /opt/mihomo -f /opt/mihomo/config.yaml
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:/opt/mihomo/logs/mihomo.log
+StandardError=append:/opt/mihomo/logs/mihomo.log
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mihomo
+
+[Install]
+WantedBy=multi-user.target

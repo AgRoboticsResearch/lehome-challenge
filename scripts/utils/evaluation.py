@@ -27,6 +27,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from .common import stabilize_garment_after_reset
 from lehome.utils.logger import get_logger
 from scripts.utils.dataset_record import create_teleop_interface
+from scripts.utils.hil_intervention import HILInterventionManager
 
 logger = get_logger(__name__)
 
@@ -38,6 +39,7 @@ def run_evaluation_loop(
     ee_solver: Optional[Any] = None,
     is_bimanual: bool = False,
     garment_name: Optional[str] = None,
+    leader_device: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """
     Core evaluation loop.
@@ -54,22 +56,18 @@ def run_evaluation_loop(
         logger.info("HIL mode enabled. Press 'i' to toggle intervention mode.")
         logger.info("  Mode starts in POLICY (automatic) mode")
 
-    # --- Policy Sync: Leader Device Setup (Optional) ---
-    leader_device = None
-    if getattr(args, 'enable_policy_sync', False):
-        # Check if teleop device type is compatible
-        if hasattr(args, 'teleop_device') and args.teleop_device in ['bi-so101leader', 'so101leader']:
-            try:
-                leader_device = create_teleop_interface(env, args)
-                logger.info(f"✅ Leader device created for policy sync: {args.teleop_device}")
-            except Exception as e:
-                logger.error(f"❌ Failed to create leader device: {e}")
-                logger.warning("Continuing with sim-only execution (no leader feedback)")
-                leader_device = None
-        else:
-            logger.warning(f"⚠️  Policy sync requires SO101 leader device")
-            logger.warning(f"   Current device: {getattr(args, 'teleop_device', None)}")
-            logger.warning("   Supported: bi-so101leader, so101leader")
+    # --- HIL Intervention Manager Setup (Optional) ---
+    # Create HIL manager when both --enable_hil and AND leader_device exists
+    hil_manager = None
+    if getattr(args, 'enable_hil', False) and leader_device is not None:
+        logger.info("Creating HIL intervention manager...")
+        hil_manager = HILInterventionManager(
+            leader_device=leader_device,
+            is_bimanual=is_bimanual,
+        )
+        logger.info(f"✅ HIL intervention manager created for {'bimanual' if is_bimanual else 'single arm'}")
+    else:
+        logger.debug(f"HIL manager not created: enable_hil={getattr(args, 'enable_hil', False)}, leader_device={leader_device is not None}")
 
     # --- Dataset Recording Setup (Optional) ---
     eval_dataset = None
@@ -198,6 +196,57 @@ def run_evaluation_loop(
         object_initial_pose = env.get_all_pose() if args.save_datasets else None
         observation_dict = env._get_observations()
 
+        # --- IDLE PHASE (HIL mode only): Wait for 'b' to start episode ---
+        if hil_handler is not None:
+            logger.info(f"[HIL] Episode {i+1}/{args.num_episodes}: Waiting for 'b' to start...")
+            hil_handler.reset_episode_start()  # Clear any previous start request
+
+            idle_count = 0
+            while True:
+                if rate_limiter:
+                    rate_limiter.sleep(env)
+
+                # Poll for keyboard input
+                hil_handler.poll()
+
+                # Check for quit request
+                if hil_handler.is_quit_requested():
+                    logger.info("[HIL] Quit requested during idle phase. Exiting...")
+                    # Cleanup and return
+                    if hil_handler:
+                        hil_handler.stop()
+                    return all_episode_metrics, True  # quit_requested = True
+
+                # Check for episode start
+                if hil_handler.is_episode_start_requested():
+                    logger.info(f"[HIL] Episode {i+1} started!")
+                    hil_handler.reset_episode_start()
+                    break
+
+                # Maintain current position during idle (hold position)
+                current_obs = env._get_observations()
+                if "observation.state" in current_obs:
+                    current_state = current_obs["observation.state"]
+                    if isinstance(current_state, np.ndarray):
+                        maintain_action = (
+                            torch.from_numpy(current_state).float().unsqueeze(0).to(env.device)
+                        )
+                    else:
+                        maintain_action = torch.zeros(
+                            1, len(current_state), dtype=torch.float32, device=env.device
+                        )
+                else:
+                    action_dim = 12 if is_bimanual else 6
+                    maintain_action = torch.zeros(
+                        1, action_dim, dtype=torch.float32, device=env.device
+                    )
+                env.step(maintain_action)
+
+                # Print idle message periodically
+                idle_count += 1
+                if idle_count % 120 == 0:  # Every ~1 second at 120Hz
+                    logger.info(f"[HIL] Press 'b' to start episode {i+1}...")
+
         # Prepare for video recording
         episode_frames = (
             {k: [] for k in observation_dict.keys() if "images" in k}
@@ -210,6 +259,7 @@ def run_evaluation_loop(
         extra_steps = 0
         success_flag = False
         success = torch.tensor(False)
+        episode_end_requested = False
 
         # Track policy actions and interventions for Evo-RL complementary_info
         policy_actions = []
@@ -227,33 +277,42 @@ def run_evaluation_loop(
             if hil_handler:
                 hil_handler.poll()
 
-                # Check for quit request (only after at least one frame is recorded)
-                if hil_handler.is_quit_requested() and frames_recorded_this_episode:
-                    logger.info("[HIL] Quit requested by user. Ending episode early...")
+                # Check for quit request
+                if hil_handler.is_quit_requested():
+                    logger.info("[HIL] Quit requested by user. Ending evaluation...")
                     break
-                elif hil_handler.is_quit_requested() and not frames_recorded_this_episode:
-                    # Quit requested but no frames yet - wait for at least one frame
-                    logger.info("[HIL] Quit requested but no frames yet. Waiting for first frame...")
 
-                # Log mode change if toggled
+                # Check for episode end request (s key)
+                if hil_handler.is_episode_end_requested():
+                    logger.info("[HIL] Episode end requested by user (s key)")
+                    episode_end_requested = True
+                    hil_handler.reset_episode_end()
+                    break
+
+                # Handle mode transitions with torque control
                 if hil_handler.is_intervention_toggled():
-                    mode = "HUMAN" if hil_handler.is_intervention_active() else "POLICY"
-                    logger.info(f"[HIL] Mode switched to: {mode}")
+                    is_intervention = hil_handler.is_intervention_active()
+                    if hil_manager:
+                        hil_manager.set_intervention_mode(is_intervention)
+                        mode = "HUMAN" if is_intervention else "POLICY"
+                        logger.info(f"[HIL] Mode switched to: {mode}")
                     hil_handler.reset_toggle()
 
-            # 3. Policy Inference (The core abstraction)
-            # Input: Numpy Dict -> Output: Numpy Array
+            # 3. Get action from policy first
+            # Policy always computes action (needed for complementary_info tracking)
+            # Note: policy.select_action() expects numpy arrays, not tensors!
             action_np = policy.select_action(observation_dict)
-            last_policy_action = action_np.copy()  # Store for complementary_info
 
-            # Check if in intervention mode (HIL: human control)
+            # Store policy action before any intervention override
+            last_policy_action = action_np.copy()
+
+            # 4. HIL Override: If in intervention mode, get action from leader device
             is_intervention = False
             if hil_handler:
                 is_intervention = hil_handler.is_intervention_active()
-                if is_intervention:
-                    # In intervention mode, action will come from SO101 leader (future)
-                    # For now, still use policy action but mark as intervention
-                    pass
+                if is_intervention and hil_manager is not None:
+                    # Override with leader action (HUMAN mode)
+                    action_np = hil_manager.get_action(action_np, hil_handler)
 
             # Track for complementary_info
             policy_actions.append(last_policy_action)
@@ -283,10 +342,15 @@ def run_evaluation_loop(
             # 6. Step Environment
             env.step(action)
 
-            # 7. Send action to leader for tactile feedback (if enabled)
-            if leader_device is not None:
+            # 7. Send feedback to leader for tactile feedback
+            if hil_manager is not None:
+                # HIL mode: use HIL manager for feedback (handles POLICY/HUMAN mode)
+                action_tensor = action.cpu().numpy().squeeze()
+                verbose = getattr(args, 'policy_sync_verbose', False) and st < 10
+                hil_manager.send_feedback(action_tensor, verbose=verbose)
+            elif leader_device is not None:
+                # Legacy policy-sync mode (non-HIL)
                 action_np = action.cpu().numpy().squeeze()
-                # Verbose mode: only for first 10 steps to avoid spam
                 verbose = getattr(args, 'policy_sync_verbose', False) and st < 10
                 try:
                     leader_device.send_feedback(action_np, verbose=verbose)
@@ -377,6 +441,13 @@ def run_evaluation_loop(
                 extra_steps -= 1
                 if extra_steps <= 0:
                     break
+
+        # Check if user requested quit during episode
+        if hil_handler and hil_handler.is_quit_requested():
+            # Cleanup and return
+            if hil_handler:
+                hil_handler.stop()
+            return all_episode_metrics, True  # quit_requested = True
 
         # --- End of Episode Handling ---
         # Check if manual label was provided via keyboard (HIL mode)
@@ -592,12 +663,11 @@ def run_evaluation_loop(
             logger.info("Finalizing dataset...")
             eval_dataset.finalize()
 
-    # Cleanup HIL keyboard handler
+    # Check if user requested quit (for HIL mode) - before stopping handler
+    quit_requested = False
     if hil_handler:
+        quit_requested = hil_handler.is_quit_requested()
         hil_handler.stop()
-
-    # Check if user requested quit (for HIL mode)
-    quit_requested = hil_handler.is_quit_requested() if hil_handler else False
 
     return all_episode_metrics, quit_requested
 
@@ -737,6 +807,32 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     env = gym.make(args.task, cfg=env_cfg).unwrapped
     env.initialize_obs()
 
+    # 6. Initialize Leader Device (for HIL or policy sync) - must be after env creation
+    leader_device = None
+    if getattr(args, 'enable_hil', False) or getattr(args, 'enable_policy_sync', False):
+        if args.teleop_device in ['so101leader', 'bi-so101leader']:
+            # Validate task and device match
+            if is_bimanual and args.teleop_device != 'bi-so101leader':
+                raise ValueError(
+                    f"Bimanual task '{args.task}' requires 'bi-so101leader' device, "
+                    f"but got '{args.teleop_device}'"
+                )
+            if not is_bimanual and args.teleop_device not in ['so101leader', 'keyboard']:
+                raise ValueError(
+                    f"Single-arm task '{args.task}' requires 'so101leader' device, "
+                    f"but got '{args.teleop_device}'"
+                )
+
+            logger.info(f"Creating leader device: {args.teleop_device}")
+            leader_device = create_teleop_interface(env=env, args=args)
+            if leader_device:
+                logger.info(f"✅ Leader device created: {args.teleop_device}")
+                logger.info("  IMPORTANT: Press 'b' on the leader device to start it before using HIL intervention")
+            else:
+                logger.warning(f"⚠️ Failed to create leader device: {args.teleop_device}")
+        else:
+            logger.info(f"HIL/Policy sync enabled but teleop_device is '{args.teleop_device}' (not a leader arm)")
+
     try:
         for garment_idx, (garment_name, garment_stage) in enumerate(eval_list):
             logger.info(
@@ -765,6 +861,7 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
                 ee_solver=ee_solver,
                 is_bimanual=is_bimanual,
                 garment_name=garment_name,
+                leader_device=leader_device,
             )
 
             all_garment_metrics.append(

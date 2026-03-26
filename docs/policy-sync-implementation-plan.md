@@ -268,8 +268,220 @@ def send_feedback(self, action, verbose=False):
 - No redundant bus operations every step
 - State tracking prevents unnecessary errors
 
-### Communication Issues (Motor 4)
-If motor 4 (wrist_flex) fails with "Incorrect status packet", this is likely a hardware issue:
-1. Check cable connection
-2. Try using single arm only
-3. Temporarily skip motor 4: `motor_values.pop("wrist_flex", None)` in send_feedback()
+---
+
+## Complete Action Pipeline: SmolVLA → SO101
+
+This section documents the full pipeline from policy output to hardware command, including normalization, unit conversion, and range mapping.
+
+### Pipeline Overview
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                    COMPLETE ACTION PIPELINE (SmolVLA → SO101)                    │
+└──────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+  │  SmolVLA    │    │ Unnormalize │    │  Rad → Deg  │    │ Joint→Motor │
+  │  Policy     │───▶│ (q01, q99)  │───▶│  ×180/π     │───▶│   Mapping   │
+  │             │    │             │    │             │    │             │
+  │ [-1, 1]     │    │ [q01, q99]  │    │ [deg range] │    │ [-100,100]  │
+  │ normalized  │    │ radians     │    │ degrees     │    │ motor vals  │
+  └─────────────┘    └─────────────┘    └─────────────┘    └──────┬──────┘
+                                                                   │
+                              ┌────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+  │   Leader    │    │ sync_write  │    │   Motor     │    │   SO101     │
+  │   Arm       │◀───│Goal_Position│◀───│   Ticks     │◀───│   Clamp     │
+  │   Moves     │    │             │    │ ×4096/360   │    │             │
+  │             │    │             │    │             │    │             │
+  │  hardware   │    │  protocol   │    │  encoder    │    │  safety     │
+  └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+```
+
+### Stage Details
+
+| Stage | Input | Output | Unit | Description |
+|-------|-------|--------|------|-------------|
+| 1. SmolVLA Policy | Observation | `[-1, 1]` | normalized | Neural network output |
+| 2. Unnormalize | Normalized | `[q01, q99]` | radians | Dataset quantile denormalization |
+| 3. Rad → Deg | Radians | Degrees | degrees | `deg = rad × 180/π` |
+| 4. Joint→Motor | Joint deg | Motor val | motor norm | Linear mapping between ranges |
+| 5. Clamp | Motor val | Clamped | motor norm | Enforce hardware limits |
+| 6. Motor Ticks | Motor deg | Ticks | encoder | `ticks = deg × 4096/360` |
+
+### Why Joint→Motor Mapping Exists
+
+The simulation and hardware use different joint limits:
+
+```
+┌─────────────────────┐          ┌─────────────────────┐
+│   SIMULATION        │          │     HARDWARE        │
+│   (USD Limits)      │          │   (Motor Limits)    │
+├─────────────────────┤          ├─────────────────────┤
+│ shoulder_pan: ±110° │  ──map──▶│ shoulder_pan: ±100  │
+│ shoulder_lift: ±100°│  ──map──▶│ shoulder_lift: ±100 │
+│ elbow_flex: -100,90°│  ──map──▶│ elbow_flex:  ±100   │  ← DIFFERENT!
+│ wrist_flex:  ±95°   │  ──map──▶│ wrist_flex:  ±100   │
+│ wrist_roll:  ±160°  │  ──map──▶│ wrist_roll:  ±160   │
+│ gripper: -10,100°   │  ──map──▶│ gripper:     0,100  │  ← DIFFERENT!
+└─────────────────────┘          └─────────────────────┘
+```
+
+The mapping ensures:
+- Sim position 0° → Motor position 0 (center preserved)
+- Sim max (110°) → Motor max (100)
+- Sim min (-110°) → Motor min (-100)
+
+---
+
+## Mathematical Verification: READ and WRITE are Inverses
+
+### Code Comparison
+
+**READ Path** (`convert_action_from_so101_leader` in `action_process.py:139-141`):
+```python
+# Motor → Joint → Radians (for sim)
+processed_degree = (joint_state[joint_name] - motor_limit_range[0]) / (
+    motor_limit_range[1] - motor_limit_range[0]
+) * (joint_limit_range[1] - joint_limit_range[0]) + joint_limit_range[0]
+```
+
+**WRITE Path** (`send_feedback` in `so101_leader.py`):
+```python
+# Radians → Joint → Motor (for hardware)
+motor_val = (
+    (degrees - joint_range[0]) / (joint_range[1] - joint_range[0])
+    * (motor_range[1] - motor_range[0]) + motor_range[0]
+)
+```
+
+### Proof of Inverse
+
+```
+READ (Motor → Joint):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  joint = (motor - M_min) / (M_max - M_min) × (J_max - J_min) + J_min        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+WRITE (Joint → Motor):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  motor = (joint - J_min) / (J_max - J_min) × (M_max - M_min) + M_min        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Prove: WRITE(READ(x)) = x
+
+Step 1: Apply READ to motor value 'm'
+        joint = (m - M_min) / (M_max - M_min) × (J_max - J_min) + J_min
+
+Step 2: Apply WRITE to result
+        new_motor = (joint - J_min) / (J_max - J_min) × (M_max - M_min) + M_min
+
+Step 3: Substitute and simplify
+        new_motor = [(m - M_min) / (M_max - M_min)] × (M_max - M_min) + M_min
+        new_motor = (m - M_min) + M_min = m  ✓
+```
+
+---
+
+## Numerical Examples
+
+### Example 1: shoulder_pan (standard joint)
+
+```
+SmolVLA output:        0.5      (normalized, in [-1,1])
+                         │
+                         ▼
+Dataset stats:        q01 = -1.2 rad,  q99 = 1.0 rad
+                         │
+                         ▼
+Denormalize:     (0.5 + 1) × (1.0 - (-1.2)) / 2 + (-1.2)
+                = 1.5 × 2.2 / 2 - 1.2
+                = 0.45 rad         (in radians)
+                         │
+                         ▼
+Rad → Deg:       0.45 × 180/π = 25.8°
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│  JOINT → MOTOR MAPPING                                         │
+│                                                                │
+│  joint_range = (-110°, 110°)  [USD limits]                     │
+│  motor_range = (-100, 100)    [HW limits]                      │
+│                                                                │
+│  motor_val = (25.8 - (-110)) / (110 - (-110))                  │
+│             × (100 - (-100)) + (-100)                          │
+│  = 135.8 / 220 × 200 - 100                                     │
+│  = 23.4          (motor normalized value)                      │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+Clamp:           23.4 is within [-100, 100] ✓
+                         │
+                         ▼
+Motor ticks:     23.4 × (4096/360) ≈ 266 ticks
+                         │
+                         ▼
+SO101 Leader receives Goal_Position = 266 ✅
+```
+
+### Example 2: gripper (asymmetric range)
+
+```
+SmolVLA output:        -0.8     (normalized)
+                         │
+                         ▼
+Dataset stats:        q01 = 0.0 rad,  q99 = 0.6 rad
+                         │
+                         ▼
+Denormalize:     (-0.8 + 1) × (0.6 - 0.0) / 2 + 0.0
+                = 0.06 rad = 3.4°
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│  JOINT → MOTOR MAPPING for gripper                             │
+│                                                                │
+│  joint_range = (-10°, 100°)  [USD limits]                      │
+│  motor_range = (0, 100)      [HW limits]                       │
+│                                                                │
+│  motor_val = (3.4 - (-10)) / (100 - (-10)) × (100 - 0) + 0     │
+│  = 13.4 / 110 × 100                                            │
+│  = 12.2          (motor value for gripper)                     │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+Gripper at 12.2 (slightly open position)
+```
+
+### Example 3: Round-trip Verification
+
+```
+START: Motor at position 50
+
+READ (Motor → Sim):
+  joint_deg = (50 - (-100)) / (100 - (-100)) × (110 - (-110)) + (-110)
+            = 150/200 × 220 - 110 = 55°
+  joint_rad = 55 × π/180 = 0.96 rad → sim receives this
+
+WRITE (Sim → Motor):
+  degrees = 0.96 × 180/π = 55°
+  motor = (55 - (-110)) / (110 - (-110)) × (100 - (-100)) + (-100)
+        = 165/220 × 200 - 100 = 50 ✓
+
+RESULT: Round-trip preserves original value! (50 → 55° → 50)
+```
+
+---
+
+## Summary Table
+
+| Aspect | READ (`convert_action_from_so101_leader`) | WRITE (`send_feedback`) |
+|--------|-------------------------------------------|-------------------------|
+| Direction | Motor → Sim | Sim → Motor |
+| Input | Motor normalized value | Radians (policy output) |
+| Output | Radians (for sim) | Motor normalized value |
+| Formula | `(m-M_min)/(M_max-M_min) × (J_max-J_min) + J_min` | `(j-J_min)/(J_max-J_min) × (M_max-M_min) + M_min` |
+| Unit Conv | deg → rad at end | rad → deg at start |
+| **Inverse** | ✓ Yes | ✓ Yes |
