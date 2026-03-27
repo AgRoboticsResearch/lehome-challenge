@@ -64,11 +64,11 @@ class GarmentEnv(DirectRLEnv):
         self.left_joint_pos = self.left_arm.data.joint_pos
         self.right_joint_pos = self.right_arm.data.joint_pos
 
-        # Setup multi-viewport for side and bot cameras (only if not headless)
+        # Setup multi-viewport for side and wrist cameras (only if not headless)
         self.left_side_viewport = None
         self.right_side_viewport = None
-        self.left_bot_viewport = None
-        self.right_bot_viewport = None
+        self.left_wrist_viewport = None
+        self.right_wrist_viewport = None
         self._setup_multi_viewport()
 
     def _setup_scene(self):
@@ -107,9 +107,9 @@ class GarmentEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _setup_multi_viewport(self):
-        """Create additional viewports for side and bot cameras.
+        """Create additional viewports for side and wrist cameras.
 
-        This creates separate viewport windows for the side and bottom cameras,
+        This creates separate viewport windows for the side and wrist cameras,
         allowing real-time visualization during teleoperation alongside the main 3D scene view.
         """
         try:
@@ -163,38 +163,38 @@ class GarmentEnv(DirectRLEnv):
                 position_y=right_pos_y,
             )
 
-            # Row 2: Bot cameras
-            left_bot_y = left_pos_y + viewport_height + 20
-            right_bot_y = left_bot_y
+            # Row 2: Wrist cameras
+            left_wrist_y = left_pos_y + viewport_height + 20
+            right_wrist_y = left_wrist_y
 
-            # Create left bot camera viewport
-            logger.debug("[GarmentEnv] Creating viewport for left bot camera...")
-            self.left_bot_viewport = create_viewport_for_camera(
-                viewport_name="Left Bot View",
-                camera_prim_path="/World/Cameras/Left_Bot_View",
+            # Create left wrist camera viewport
+            logger.debug("[GarmentEnv] Creating viewport for left wrist camera...")
+            self.left_wrist_viewport = create_viewport_for_camera(
+                viewport_name="Left Wrist View",
+                camera_prim_path="/World/Robot/Left_Robot/gripper/left_wrist_camera",
                 width=viewport_width,
                 height=viewport_height,
                 position_x=left_pos_x,
-                position_y=left_bot_y,
+                position_y=left_wrist_y,
             )
 
-            # Create right bot camera viewport
-            logger.debug("[GarmentEnv] Creating viewport for right bot camera...")
-            self.right_bot_viewport = create_viewport_for_camera(
-                viewport_name="Right Bot View",
-                camera_prim_path="/World/Cameras/Right_Bot_View",
+            # Create right wrist camera viewport
+            logger.debug("[GarmentEnv] Creating viewport for right wrist camera...")
+            self.right_wrist_viewport = create_viewport_for_camera(
+                viewport_name="Right Wrist View",
+                camera_prim_path="/World/Robot/Right_Robot/gripper/right_wrist_camera",
                 width=viewport_width,
                 height=viewport_height,
                 position_x=right_pos_x,
-                position_y=right_bot_y,
+                position_y=right_wrist_y,
             )
 
             logger.info(
                 "[GarmentEnv] Multi-viewport setup complete: "
                 f"Left side view ({left_pos_x},{left_pos_y}), "
                 f"Right side view ({right_pos_x},{right_pos_y}), "
-                f"Left bot view ({left_pos_x},{left_bot_y}), "
-                f"Right bot view ({right_pos_x},{right_bot_y})"
+                f"Left wrist view ({left_pos_x},{left_wrist_y}), "
+                f"Right wrist view ({right_pos_x},{right_wrist_y})"
             )
 
         except ImportError as e:
@@ -203,8 +203,8 @@ class GarmentEnv(DirectRLEnv):
             logger.warning(f"[GarmentEnv] Failed to create multi-viewport: {e}")
             self.left_side_viewport = None
             self.right_side_viewport = None
-            self.left_bot_viewport = None
-            self.right_bot_viewport = None
+            self.left_wrist_viewport = None
+            self.right_wrist_viewport = None
 
     def _create_garment_object(self):
         """
@@ -885,7 +885,7 @@ class GarmentEnv(DirectRLEnv):
             pass
 
     def _cleanup_viewports(self):
-        """Clean up viewport windows created for side and bot cameras."""
+        """Clean up viewport windows created for side and wrist cameras."""
         try:
             if hasattr(self, 'left_side_viewport') and self.left_side_viewport is not None:
                 self.left_side_viewport.destroy()
@@ -903,17 +903,17 @@ class GarmentEnv(DirectRLEnv):
             logger.debug(f"[GarmentEnv] Error destroying right side viewport: {e}")
 
         try:
-            if hasattr(self, 'left_bot_viewport') and self.left_bot_viewport is not None:
-                self.left_bot_viewport.destroy()
-                self.left_bot_viewport = None
-                logger.debug("[GarmentEnv] Left bot viewport destroyed")
+            if hasattr(self, 'left_wrist_viewport') and self.left_wrist_viewport is not None:
+                self.left_wrist_viewport.destroy()
+                self.left_wrist_viewport = None
+                logger.debug("[GarmentEnv] Left wrist viewport destroyed")
         except Exception as e:
-            logger.debug(f"[GarmentEnv] Error destroying left bot viewport: {e}")
+            logger.debug(f"[GarmentEnv] Error destroying left wrist viewport: {e}")
 
         try:
-            if hasattr(self, 'right_bot_viewport') and self.right_bot_viewport is not None:
-                self.right_bot_viewport.destroy()
-                self.right_bot_viewport = None
-                logger.debug("[GarmentEnv] Right bot viewport destroyed")
+            if hasattr(self, 'right_wrist_viewport') and self.right_wrist_viewport is not None:
+                self.right_wrist_viewport.destroy()
+                self.right_wrist_viewport = None
+                logger.debug("[GarmentEnv] Right wrist viewport destroyed")
         except Exception as e:
-            logger.debug(f"[GarmentEnv] Error destroying right bot viewport: {e}")
+            logger.debug(f"[GarmentEnv] Error destroying right wrist viewport: {e}")

@@ -26,7 +26,7 @@ class GarmentEnvCfg(DirectRLEnvCfg):
         dt=1 / 120,  # Faster physics for better responsiveness (8.3ms per step)
         render_interval=decimation,  # Render every physics step for smooth visuals
         render=render_cfg,
-        use_fabric=True,
+        use_fabric=False,
     )
     # garment_name (str): Garment name in the format "Type_Length_Seen/Unseen_Index",
     # e.g., "Top_Long_Unseen_0", "Top_Short_Seen_1",
