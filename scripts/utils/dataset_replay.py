@@ -229,8 +229,8 @@ def create_replay_dataset(
     # Use the same features as the source dataset
     features = source_dataset.meta.features
 
-    # Optionally remove depth if disabled
-    if args.disable_depth and "observation.top_depth" in features:
+    # Optionally remove depth if not enabled
+    if not getattr(args, "enable_depth", False) and "observation.top_depth" in features:
         features = {k: v for k, v in features.items() if k != "observation.top_depth"}
 
     logger.info(f"Creating replay dataset at: {root}")
@@ -362,7 +362,7 @@ def replay_episode(
     initial_pose: Optional[Dict[str, Any]],
     args: argparse.Namespace,
     replay_dataset: Optional[LeRobotDataset] = None,
-    disable_depth: bool = False,
+    enable_depth: bool = False,
     ik_solver: Optional[Any] = None,
     is_bimanual: bool = False,
     ik_stats: Optional[Dict[str, Any]] = None,
@@ -378,7 +378,7 @@ def replay_episode(
         initial_pose: Initial object pose dictionary.
         args: Command-line arguments.
         replay_dataset: Optional dataset for saving replayed observations.
-        disable_depth: Whether to disable depth observation.
+        enable_depth: Whether to enable depth observation (default: disabled).
         ik_solver: Optional IK solver for ee_pose control.
         is_bimanual: Whether using dual-arm configuration.
         ik_stats: Optional dictionary to track IK statistics.
@@ -435,8 +435,8 @@ def replay_episode(
             if replay_dataset is not None:
                 observations = env._get_observations()
 
-                # Remove depth if disabled
-                if disable_depth and "observation.top_depth" in observations:
+                # Remove depth if not enabled
+                if not enable_depth and "observation.top_depth" in observations:
                     observations = {
                         k: v
                         for k, v in observations.items()
@@ -646,7 +646,7 @@ def replay(args: argparse.Namespace) -> None:
                     initial_pose=initial_pose,
                     args=args,
                     replay_dataset=replay_dataset,
-                    disable_depth=args.disable_depth,
+                    enable_depth=getattr(args, "enable_depth", False),
                     ik_solver=ik_solver,
                     is_bimanual=is_bimanual,
                     ik_stats=ik_stats,

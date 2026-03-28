@@ -22,11 +22,15 @@ from lerobot.datasets.dataset_tools import merge_datasets
 from lerobot.utils.utils import init_logging
 
 
-def get_feature_hash(info_path: Path) -> str:
+def get_feature_hash(info_path: Path, drop_features: list[str] | None = None) -> str:
     """Get a hash of the features to group compatible datasets."""
+    drop_features = drop_features or []
     with open(info_path) as f:
         info = json.load(f)
-    features = info.get("features", {})
+    features = info.get("features", {}).copy()
+    # Remove dropped features before hashing
+    for feat in drop_features:
+        features.pop(feat, None)
     # Create deterministic string representation
     feature_str = json.dumps(features, sort_keys=True)
     return hashlib.md5(feature_str.encode()).hexdigest()[:8]
@@ -304,11 +308,11 @@ def merge_subdirectories(
         print("No valid LeRobot datasets found to merge")
         return
 
-    # Group datasets by feature compatibility
+    # Group datasets by feature compatibility (after dropping specified features)
     feature_groups: dict[str, list[Path]] = {}
     for subdir in subdirs:
         info_path = subdir / "meta" / "info.json"
-        feature_hash = get_feature_hash(info_path)
+        feature_hash = get_feature_hash(info_path, drop_features)
         if feature_hash not in feature_groups:
             feature_groups[feature_hash] = []
         feature_groups[feature_hash].append(subdir)

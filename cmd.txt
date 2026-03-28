@@ -2,5 +2,4 @@ python scripts/dataset/merge_subdatasets.py \
       --source Datasets/pant_long_newdata_0329 \
       --output Datasets/pant_long_merged \
       --repo_id pant_long_merged \
-      --drop_features observation.top_depth \
-      --exclude merged
+      --drop_features observation.top_depth

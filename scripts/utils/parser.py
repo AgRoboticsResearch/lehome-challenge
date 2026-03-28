@@ -123,10 +123,10 @@ def setup_record_parser(
         help="Root directory for saving recorded datasets (default: Datasets/record)",
     )
     parser.add_argument(
-        "--disable_depth",
+        "--enable_depth",
         action="store_true",
         default=False,
-        help="Disable using top depth observation in env and dataset.",
+        help="Enable top depth observation in env and dataset (default: disabled).",
     )
     parser.add_argument(
         "--enable_pointcloud",
@@ -260,10 +260,10 @@ def setup_replay_parser(
         help="Joint angle unit for kinematic solver (default: rad).",
     )
     parser.add_argument(
-        "--disable_depth",
+        "--enable_depth",
         action="store_true",
         default=False,
-        help="Disable depth observation during replay.",
+        help="Enable top depth observation in env and dataset (default: disabled).",
     )
 
     return parser

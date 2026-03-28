@@ -266,7 +266,7 @@ def create_dataset_if_needed(
         },
     }
 
-    if not getattr(args, "disable_depth", False):
+    if getattr(args, "enable_depth", False):
         features["observation.top_depth"] = {
             "dtype": "uint16",
             "shape": (480, 640),
@@ -537,7 +537,7 @@ def run_recording_phase(
 
             observations = env._get_observations()
             if (
-                getattr(args, "disable_depth", False)
+                not getattr(args, "enable_depth", False)
                 and "observation.top_depth" in observations
             ):
                 observations.pop("observation.top_depth")
