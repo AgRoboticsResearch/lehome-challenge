@@ -146,8 +146,8 @@ def run_evaluation_loop(
 
         if save_mode == "both":
             # Create two separate datasets for success and failure
-            success_path = get_next_experiment_path_with_gap(root_path / "success")
-            failure_path = get_next_experiment_path_with_gap(root_path / "failure")
+            success_path = get_next_experiment_path_with_gap(root_path / "success", name_prefix=args.garment_type)
+            failure_path = get_next_experiment_path_with_gap(root_path / "failure", name_prefix=args.garment_type)
 
             eval_dataset_success = LeRobotDataset.create(
                 repo_id="lehome_eval_success",
@@ -174,7 +174,7 @@ def run_evaluation_loop(
             eval_dataset = LeRobotDataset.create(
                 repo_id="lehome_eval",
                 fps=fps,
-                root=get_next_experiment_path_with_gap(root_path),
+                root=get_next_experiment_path_with_gap(root_path, name_prefix=args.garment_type),
                 use_videos=True,
                 image_writer_threads=8,
                 image_writer_processes=0,
@@ -755,42 +755,48 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
         logger.info(f"IK solver loaded.")
 
     # 4. Load Evaluation List
-    # Only loads from 'Release' directory based on garment_type
-    eval_list = []  # List of (name, stage)
+    # List of (name, stage)
+    eval_list = []
 
-    # Evaluate a specific category based on garment_type
-    if args.garment_type == "custom":
-        # For 'custom' type, we load from the root Release_test_list.txt
-        eval_list_path = os.path.join(
-            args.garment_cfg_base_path, "Release", "Release_test_list.txt"
-        )
+    # Check if evaluating a single specific garment
+    if args.garment_name:
+        # Single garment mode: evaluate only the specified garment
+        eval_list = [(args.garment_name, "Release")]
+        logger.info(f"Single garment mode: evaluating '{args.garment_name}'")
     else:
-        # Map argument to specific sub-category directory
-        type_map = {
-            "top_long": "Top_Long",
-            "top_short": "Top_Short",
-            "pant_long": "Pant_Long",
-            "pant_short": "Pant_Short",
-        }
-        file_prefix = type_map.get(args.garment_type, "Top_Long")
-        # Path: Assets/objects/Challenge_Garment/Release/Top_Long/Top_Long.txt
-        eval_list_path = os.path.join(
-            args.garment_cfg_base_path, "Release", file_prefix, f"{file_prefix}.txt"
+        # Category mode: load all garments of the specified type
+        if args.garment_type == "custom":
+            # For 'custom' type, we load from the root Release_test_list.txt
+            eval_list_path = os.path.join(
+                args.garment_cfg_base_path, "Release", "Release_test_list.txt"
+            )
+        else:
+            # Map argument to specific sub-category directory
+            type_map = {
+                "top_long": "Top_Long",
+                "top_short": "Top_Short",
+                "pant_long": "Pant_Long",
+                "pant_short": "Pant_Short",
+            }
+            file_prefix = type_map.get(args.garment_type, "Top_Long")
+            # Path: Assets/objects/Challenge_Garment/Release/Top_Long/Top_Long.txt
+            eval_list_path = os.path.join(
+                args.garment_cfg_base_path, "Release", file_prefix, f"{file_prefix}.txt"
+            )
+
+        logger.info(
+            f"Loading evaluation list for category '{args.garment_type}' from: {eval_list_path}"
         )
 
-    logger.info(
-        f"Loading evaluation list for category '{args.garment_type}' from: {eval_list_path}"
-    )
+        if not os.path.exists(eval_list_path):
+            raise FileNotFoundError(f"Evaluation list not found: {eval_list_path}")
 
-    if not os.path.exists(eval_list_path):
-        raise FileNotFoundError(f"Evaluation list not found: {eval_list_path}")
+        with open(eval_list_path, "r") as f:
+            names = [line.strip() for line in f.readlines() if line.strip()]
+            for name in names:
+                eval_list.append((name, "Release"))
 
-    with open(eval_list_path, "r") as f:
-        names = [line.strip() for line in f.readlines() if line.strip()]
-        for name in names:
-            eval_list.append((name, "Release"))
-
-    logger.info(f"Loaded {len(eval_list)} garments for category: {args.garment_type}")
+        logger.info(f"Loaded {len(eval_list)} garments for category: {args.garment_type}")
 
     if not eval_list:
         raise ValueError(

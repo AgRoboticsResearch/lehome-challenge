@@ -69,7 +69,7 @@ class GarmentEnv(DirectRLEnv):
         self.right_side_viewport = None
         self.left_wrist_viewport = None
         self.right_wrist_viewport = None
-        self._setup_multi_viewport()
+        # self._setup_multi_viewport()  # Disabled: only using main viewport
 
     def _setup_scene(self):
         self.left_arm = Articulation(self.cfg.left_robot)

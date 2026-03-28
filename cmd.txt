@@ -946,18 +946,21 @@ python -m scripts.dataset_sim record \
     --teleop_device bi-so101leader \
     --garment_name Top_Long_Unseen_0 \
     --enable_record \
-    --num_episode 10 \
+    --num_datasets 5 \
+    --num_episode 1 \
     --device cpu \
     --enable_cameras
 
 DISPLAY=:1 python -m scripts.dataset_sim record \
     --teleop_device bi-so101leader \
-    --left_arm_port /dev/ttyACM1 \
-    --right_arm_port /dev/ttyACM0 \
-    --garment_name Top_Long_Unseen_0 \
+    --left_arm_port /dev/ttyACM0 \
+    --right_arm_port /dev/ttyACM1 \
+    --garment_name Pant_Long_Unseen_0 \
     --enable_record \
-    --num_episode 10 \
+    --num_datasets 5 \
+    --num_episode 1 \
     --device cpu \
+    --log_success \
     --enable_cameras
 
 
@@ -995,7 +998,7 @@ DISPLAY=:1 python -m scripts.test_so101_pyserial \
 
 DISPLAY=:1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python -m scripts.eval \
     --policy_type lerobot \
-    --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/004000/pretrained_model \
+    --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/009000/pretrained_model \
     --dataset_root Datasets/example/four_types_merged \
     --garment_type "pant_long" \
     --teleop_device bi-so101leader \
@@ -1006,19 +1009,25 @@ DISPLAY=:1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python -m scripts.eval \
     --policy_sync_verbose \
     --num_episodes 1
 
-DISPLAY=:1 python -m scripts.eval \
-    --policy_type lerobot \
-    --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/004000/pretrained_model \
-    --dataset_root Datasets/example/four_types_merged \
-    --garment_type pant_long \
-    --enable_policy_sync \
-    --teleop_device bi-so101leader \
-    --left_arm_port /dev/ttyACM0 \
-    --right_arm_port /dev/ttyACM1 \
-    --device cpu \
-    --recalibrate \
-    --policy_sync_verbose \
-    --num_episodes 1
+
+DISPLAY=:1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python -m scripts.eval \
+      --policy_type lerobot \
+      --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/009000/pretrained_model \
+      --dataset_root Datasets/example/four_types_merged \
+      --garment_name Pant_Long_Unseen_0 \
+      --teleop_device bi-so101leader \
+      --left_arm_port /dev/ttyACM0 \
+      --right_arm_port /dev/ttyACM1 \
+      --device cpu \
+      --enable_hil \
+      --policy_sync_verbose \
+      --max_steps 1200 \
+      --num_episodes 1 \
+      --save_datasets \
+      --eval_dataset_path Datasets/record \
+      --save_mode all    
 
 
 exec su -l $USER
+
+python -m scripts.dataset inspect --dataset_root Datasets/record/pant_long_20260328_185934

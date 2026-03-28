@@ -116,13 +116,16 @@ class SO101Leader(Device):
             elif key.char == "s":
                 if self.other_key_enable == True:
                     self.b_disable = True
-                    self._additional_callbacks["S"]()
+                    if "S" in self._additional_callbacks:
+                        self._additional_callbacks["S"]()
             elif key.char == "n":
                 if self.other_key_enable == True:
-                    self._additional_callbacks["N"]()
+                    if "N" in self._additional_callbacks:
+                        self._additional_callbacks["N"]()
             elif key.char == "d":
                 if self.other_key_enable == True:
-                    self._additional_callbacks["D"]()
+                    if "D" in self._additional_callbacks:
+                        self._additional_callbacks["D"]()
         except AttributeError:
             # Handle special keys (like ESC)
             if key == Key.esc and "ESCAPE" in self._additional_callbacks:

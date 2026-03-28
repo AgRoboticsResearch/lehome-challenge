@@ -26,10 +26,71 @@ from lehome.utils.record import (
     append_episode_initial_pose,
 )
 from lehome.utils.logger import get_logger
+from lehome.utils.success_checker_chanllege import success_checker_garment_fold
 
 from .common import stabilize_garment_after_reset
 
 logger = get_logger(__name__)
+
+
+def log_success_check_details(result: dict) -> None:
+    """Log detailed success check information similar to garment_bi_v2.py.
+
+    Args:
+        result: Result dict from success_checker_garment_fold containing:
+            - success: bool
+            - garment_type: str
+            - thresholds: list
+            - details: dict of condition info
+    """
+    if not isinstance(result, dict):
+        return
+
+    logger.info(
+        f"[Success Check] Garment type: {result.get('garment_type', 'unknown')}, "
+        f"Thresholds: {result.get('thresholds', [])}"
+    )
+
+    details = result.get("details", {})
+    for key, condition_info in details.items():
+        status = "✓" if condition_info.get("passed", False) else "✗"
+        logger.info(
+            f"  {condition_info.get('description', '')} -> {status}"
+        )
+
+    success = result.get("success", False)
+    logger.info(
+        f"[Success Check] Final result: {'Success ✓' if success else 'Failed ✗'}"
+    )
+
+
+def _log_detailed_success_check(env: DirectRLEnv, args: argparse.Namespace) -> None:
+    """Perform and log detailed success check during recording.
+
+    This bypasses the step_interval decorator to provide real-time feedback.
+
+    Args:
+        env: Environment instance.
+        args: Command-line arguments.
+    """
+    try:
+        # Check if environment has the required attributes
+        if not hasattr(env, "object") or env.object is None:
+            return
+        if not hasattr(env, "garment_loader"):
+            return
+        if not hasattr(env, "cfg") or not hasattr(env.cfg, "garment_name"):
+            return
+
+        # Get garment type and run success checker
+        garment_type = env.garment_loader.get_garment_type(env.cfg.garment_name)
+        result = success_checker_garment_fold(env.object, garment_type)
+
+        # Log detailed results
+        log_success_check_details(result)
+
+    except Exception as e:
+        logger.debug(f"[Success Check] Error during detailed check: {e}")
 
 
 def validate_task_and_device(args: argparse.Namespace) -> None:
@@ -149,11 +210,13 @@ def register_teleop_callbacks(
 
 def create_dataset_if_needed(
     args: argparse.Namespace,
+    dataset_index: int = 0,
 ) -> Tuple[Optional[LeRobotDataset], Optional[Path], Optional[Any], bool]:
     """Create LeRobotDataset if recording is enabled.
 
     Args:
         args: Command-line arguments containing recording configuration.
+        dataset_index: Index of the current dataset (unused, kept for compatibility).
 
     Returns:
         Tuple of (dataset, json_path, solver, is_bi_arm):
@@ -267,10 +330,29 @@ def create_dataset_if_needed(
 
     root_path = Path(getattr(args, "dataset_root", "Datasets/record"))
 
+    # Extract garment type prefix from garment_name for folder naming
+    # e.g., "Top_Long_Unseen_0" -> "top_long_20240328_143022"
+    garment_name = getattr(args, "garment_name", None)
+    if garment_name:
+        parts = garment_name.split("_")
+        if len(parts) >= 2:
+            garment_prefix = f"{parts[0].lower()}_{parts[1].lower()}"  # "top_long"
+        else:
+            garment_prefix = parts[0].lower()
+    elif hasattr(args, "garment_type"):
+        garment_prefix = args.garment_type  # Fallback to garment_type if available
+    else:
+        garment_prefix = "dataset"
+
+    # Create name with datetime: top_long_20240328_143022
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name_prefix = f"{garment_prefix}_{timestamp}"
+
     dataset = LeRobotDataset.create(
         repo_id="abc",
         fps=30,
-        root=get_next_experiment_path_with_gap(root_path),
+        root=get_next_experiment_path_with_gap(root_path, name_prefix=name_prefix),
         use_videos=True,
         image_writer_threads=8,
         image_writer_processes=0,
@@ -400,6 +482,7 @@ def run_recording_phase(
     """
     episode_index = 0
     object_initial_pose = initial_object_pose
+    step_counter = 0  # Track steps for periodic success check logging
 
     # Ensure we have a valid initial pose for the first episode
     if object_initial_pose is None:
@@ -415,7 +498,8 @@ def run_recording_phase(
 
         flags["success"] = False
         flags["remove"] = False
-
+        success_detected = False  # Track if env reports success during this episode
+        step_counter = 0  # Track steps for periodic success check logging
         # Loop within a single episode
         while not flags["success"]:
             # Check if recording should be aborted
@@ -424,6 +508,12 @@ def run_recording_phase(
                 dataset.finalize()
                 logger.warning(f"Recording aborted, completed {episode_index} episodes")
                 return object_initial_pose
+
+            step_counter += 1
+
+            # Periodic detailed success check logging (every 30 steps)
+            if step_counter % 30 == 0:
+                _log_detailed_success_check(env, args)
 
             try:
                 dynamic_reset_gripper_effort_limit_sim(env, args.teleop_device)
@@ -438,8 +528,12 @@ def run_recording_phase(
             else:
                 env.step(actions)
 
-            if args.log_success:
-                success = env._get_success()
+            # Check success from environment and display to operator
+            success = env._get_success()
+            if success.item() and not success_detected:
+                success_detected = True
+                logger.info("✅ [Recording] SUCCESS detected by environment!")
+                logger.info("   Press 'N' to confirm and save, or continue recording...")
 
             observations = env._get_observations()
             if (
@@ -517,6 +611,12 @@ def run_recording_phase(
                         object_initial_pose = None
                 flags["remove"] = False
                 continue
+
+        # Episode ended - show success status
+        if success_detected:
+            logger.info(f"[Recording] Episode {episode_index} ended with SUCCESS (env detected)")
+        else:
+            logger.info(f"[Recording] Episode {episode_index} ended (no env success detected)")
 
         save_start_time = time.time()
         logger.info(f"[Recording] Saving episode {episode_index}...")
@@ -624,7 +724,12 @@ def run_live_control_without_record(
 
 
 def record_dataset(args: argparse.Namespace, simulation_app: SimulationApp) -> None:
-    """Record dataset."""
+    """Record dataset.
+
+    Supports recording multiple datasets with the same garment configuration.
+    Each dataset will have its own folder with naming: {garment_prefix}_{YYYYMMDD_HHMMSS}
+    (e.g., top_long_20240328_143022, top_long_20240328_150315)
+    """
     # Get device configuration (default to "cpu" for compatibility)
     device = getattr(args, "device", "cpu")
 
@@ -653,13 +758,17 @@ def record_dataset(args: argparse.Namespace, simulation_app: SimulationApp) -> N
         teleop_interface, recording_enabled=args.enable_record
     )
     teleop_interface.reset()
-    dataset, json_path, ee_solver, is_bi_arm = create_dataset_if_needed(args)
+
     count_render = 0
     printed_instructions = False
     idle_frame_counter = 0
     object_initial_pose: Optional[Dict[str, Any]] = None
 
+    # Get number of datasets (default to 1 if not specified)
+    num_datasets = getattr(args, "num_datasets", 1)
+
     try:
+        # ========== IDLE PHASE (once before all datasets) ==========
         while simulation_app.is_running():
             with torch.inference_mode():
                 if not flags["start"]:
@@ -681,33 +790,98 @@ def record_dataset(args: argparse.Namespace, simulation_app: SimulationApp) -> N
                             logger.info(str(teleop_interface))
                             logger.info("=" * 60 + "\n\n")
                             printed_instructions = True
-                elif args.enable_record and dataset is not None:
-                    object_initial_pose = run_recording_phase(
-                        env,
-                        teleop_interface,
-                        args,
-                        flags,
-                        dataset,
-                        json_path,
-                        object_initial_pose,
-                        ee_solver,
-                        is_bi_arm,
-                    )
+
+                elif args.enable_record:
+                    # ========== DATASET LOOP ==========
+                    for dataset_index in range(num_datasets):
+                        logger.info("=" * 60)
+                        logger.info(f"📦 DATASET {dataset_index + 1}/{num_datasets}")
+                        logger.info("=" * 60)
+
+                        # Create new dataset for this iteration
+                        dataset, json_path, ee_solver, is_bi_arm = create_dataset_if_needed(
+                            args, dataset_index=dataset_index
+                        )
+
+                        if dataset is None:
+                            logger.error("Failed to create dataset, skipping...")
+                            continue
+
+                        logger.info(f"Dataset created at: {dataset.root}")
+
+                        # Run recording phase for this dataset
+                        object_initial_pose = run_recording_phase(
+                            env,
+                            teleop_interface,
+                            args,
+                            flags,
+                            dataset,
+                            json_path,
+                            object_initial_pose,
+                            ee_solver,
+                            is_bi_arm,
+                        )
+
+                        # Check if recording was aborted
+                        if flags["abort"]:
+                            logger.warning("Recording aborted by user")
+                            break
+
+                        # Reset environment for next dataset (if not the last one)
+                        if dataset_index < num_datasets - 1:
+                            logger.info("Resetting environment for next dataset...")
+                            try:
+                                env.reset()
+                                stabilize_garment_after_reset(env, args)
+                                object_initial_pose = env.get_all_pose()
+                            except Exception as e:
+                                logger.error(f"Failed to reset environment: {e}")
+                                traceback.print_exc()
+
+                            # Reset flags for next dataset
+                            flags["start"] = False
+                            flags["success"] = False
+                            flags["remove"] = False
+
+                            logger.info(f"Ready for dataset {dataset_index + 2}/{num_datasets}")
+                            logger.info("Press 'S' to start recording next dataset...")
+
+                            # Wait for user to press S again for next dataset
+                            while not flags["start"] and not flags["abort"]:
+                                if not simulation_app.is_running():
+                                    break
+                                with torch.inference_mode():
+                                    pose, _ = run_idle_phase(
+                                        env,
+                                        teleop_interface,
+                                        args,
+                                        count_render,
+                                    )
+                                    if pose is not None:
+                                        object_initial_pose = pose
+
+                            if flags["abort"]:
+                                logger.warning("Recording aborted by user")
+                                break
+
+                    # All datasets completed
+                    logger.info("=" * 60)
+                    logger.info(f"✅ All {num_datasets} datasets completed!")
+                    logger.info("=" * 60)
                     break
+
                 else:
                     run_live_control_without_record(env, teleop_interface, args)
+
     except KeyboardInterrupt:
         logger.warning("\n[Ctrl+C] Interrupt signal detected")
-        # If Ctrl+C is pressed during recording, clear the current buffer
-        if args.enable_record and dataset is not None and flags["start"]:
-            logger.info("Clearing current episode buffer...")
-            dataset.clear_episode_buffer()
-            logger.info("Buffer cleared, dataset remains intact")
-            dataset.finalize()
-            logger.info("Dataset saved")
+        # Note: dataset is now created inside the loop, so we can't access it here
+        # The cleanup is handled inside run_recording_phase
+        logger.info("Recording interrupted")
 
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
+        traceback.print_exc()
 
     finally:
         env.close()

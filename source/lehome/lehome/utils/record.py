@@ -2,6 +2,7 @@ from pathlib import Path
 import time
 import json
 import numpy as np
+from datetime import datetime
 
 # Try to import OmegaConf for handling ListConfig/DictConfig
 try:
@@ -40,25 +41,43 @@ class RateLimiter:
                 self.last_time += self.sleep_duration
 
 
-def get_next_experiment_path_with_gap(base_path: Path) -> Path:
-    """Find the first available number (including open positions)"""
+def get_next_experiment_path_with_gap(base_path: Path, name_prefix: str = None) -> Path:
+    """Generate experiment path with timestamp-based naming.
+
+    Args:
+        base_path: Base directory for experiments
+        name_prefix: Optional prefix (e.g., "top_long") for timestamp-based naming.
+                     If None, falls back to numbered naming (001, 002, ...)
+
+    Returns:
+        Path to the new experiment folder
+
+    Examples:
+        With prefix: Datasets/record/top_long_20240327_143000
+        Without prefix: Datasets/record/001
+    """
     base_path.mkdir(parents=True, exist_ok=True)
 
-    # collect existing indices
-    indices = set()
-    for folder in base_path.iterdir():
-        if folder.is_dir():
-            try:
-                indices.add(int(folder.name))
-            except ValueError:
-                continue
+    if name_prefix:
+        # Use timestamp-based naming
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder_name = f"{name_prefix}_{timestamp}"
+        return base_path / folder_name
+    else:
+        # Fallback to numbered naming
+        indices = set()
+        for folder in base_path.iterdir():
+            if folder.is_dir():
+                try:
+                    indices.add(int(folder.name))
+                except ValueError:
+                    continue
 
-    # find the first available index
-    folder_index = 1
-    while folder_index in indices:
-        folder_index += 1
+        folder_index = 1
+        while folder_index in indices:
+            folder_index += 1
 
-    return base_path / f"{folder_index:03d}"
+        return base_path / f"{folder_index:03d}"
 
 
 def _ndarray_to_list(obj):

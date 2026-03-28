@@ -92,7 +92,7 @@ def setup_record_parser(
         "--log_success",
         action="store_true",
         default=False,
-        help="Log success information.",
+        help="Display success detection info during recording (shows when env._get_success() returns True).",
     )
     # Recording Parameters
     parser.add_argument(
@@ -108,7 +108,13 @@ def setup_record_parser(
         "--num_episode",
         type=int,
         default=20,
-        help="Maximum number of episodes to record",
+        help="Maximum number of episodes to record per dataset",
+    )
+    parser.add_argument(
+        "--num_datasets",
+        type=int,
+        default=1,
+        help="Number of datasets to record (default: 1). Each dataset will have num_episode episodes.",
     )
     parser.add_argument(
         "--dataset_root",
@@ -430,6 +436,12 @@ def setup_eval_parser() -> argparse.ArgumentParser:
         default="top_long",
         choices=["top_long", "top_short", "pant_long", "pant_short", "custom"],
         help="Type of garments to evaluate.",
+    )
+    parser.add_argument(
+        "--garment_name",
+        type=str,
+        default=None,
+        help="Name of a specific garment to evaluate (e.g., 'Pant_Long_Unseen_0'). If set, overrides --garment_type and evaluates only this single garment.",
     )
     parser.add_argument(
         "--garment_cfg_base_path",
