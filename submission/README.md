@@ -57,10 +57,10 @@ python -c "from scripts.eval_policy import MoESmolVLAPolicy; print('eval_policy 
 ```
 
 ### Download Checkpoints
-Download from [HuggingFace](https://huggingface.co/datasets/linsheng888/lehome-challenge-brl-sroi):
+Download from [HuggingFace](https://huggingface.co/linsheng888/lehome-challenge-brl-sroi):
 
 ```bash
-huggingface-cli download linsheng888/lehome-challenge-brl-sroi --repo-type dataset --local-dir outputs/moe_train
+hf download linsheng888/lehome-challenge-brl-sroi --local-dir outputs/moe_train
 ```
 
 Expected directory structure:
