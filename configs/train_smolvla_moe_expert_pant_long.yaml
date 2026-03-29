@@ -1,6 +1,6 @@
 dataset:
   repo_id: repo_smolvla_pant_long
-  root: Datasets/pant_long_merged_0329
+  root: Datasets/pant_long_newdata_0329_merged_no_depth
 
 policy:
   type: smolvla

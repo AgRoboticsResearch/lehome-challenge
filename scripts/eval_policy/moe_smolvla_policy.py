@@ -17,6 +17,9 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+# Import to register smolvla_new_line_processor in ProcessorStepRegistry
+# This is required for loading expert preprocessors with normalization stats
+from lerobot.policies.smolvla.processor_smolvla import SmolVLANewLineProcessor  # noqa: F401
 
 from lehome.utils.logger import get_logger
 from scripts.eval_policy.base_policy import BasePolicy
@@ -34,7 +37,8 @@ class MoESmolVLAPolicy(BasePolicy):
         - Shared VLM (vision encoder + text embeddings)
         - Shared state_proj (frozen)
         - Independent lm_expert per garment type
-        - Independent action projections per garment type
+        - Independent action projections (action_in_proj, action_out_proj) per garment type
+        - Independent action_time_mlp (in/out) per garment type (Flow Matching time encoding)
         - Router selects expert based on visual features
     """
 
@@ -151,9 +155,9 @@ class MoESmolVLAPolicy(BasePolicy):
         # Extract shared VLM model
         self.vlm_with_expert = self.base_policy.model.vlm_with_expert
 
-        # Store device and config
-        self.device_type = self.vlm_with_expert.config.text_config.hidden_size
-        logger.info(f"VLM hidden size: {self.device_type}")
+        # Store config
+        self.vlm_hidden_size = self.vlm_with_expert.config.text_config.hidden_size
+        logger.info(f"VLM hidden size: {self.vlm_hidden_size}")
 
         # Load experts (independent components)
         logger.info("Loading expert models...")
@@ -188,10 +192,10 @@ class MoESmolVLAPolicy(BasePolicy):
         """Get default expert checkpoint paths from moe_train directory."""
         base_path = Path("outputs/moe_train")
         return {
-            "pant_short": base_path / "smolvla_moe_expert_pant_short_no_st_proj/checkpoints/003000/pretrained_model",
-            "pant_long": base_path / "smolvla_moe_expert_pant_long_no_st_proj/checkpoints/004000/pretrained_model",
-            "top_short": base_path / "smolvla_moe_expert_top_short_no_st_proj/checkpoints/008000/pretrained_model",
-            "top_long": base_path / "smolvla_moe_expert_top_long_no_st_proj/checkpoints/008000/pretrained_model",
+            "pant_short": base_path / "smolvla_moe_expert_pant_short_no_st_proj/checkpoints/010000/pretrained_model",
+            "pant_long": base_path / "smolvla_moe_expert_pant_long_no_st_proj/checkpoints/009000/pretrained_model",
+            "top_short": base_path / "smolvla_moe_expert_top_short_no_st_proj/checkpoints/014000/pretrained_model",
+            "top_long": base_path / "smolvla_moe_expert_top_long_no_st_proj/checkpoints/011000/pretrained_model",
         }
 
     def _log_expert_status(self):
@@ -261,10 +265,20 @@ class MoESmolVLAPolicy(BasePolicy):
         return policy
 
     def _load_expert_checkpoint(self, checkpoint_path: str, garment_type: str) -> Dict[str, nn.Module]:
-        """Load expert-specific components (lm_expert, action projections).
+        """Load expert-specific components (lm_expert, action projections, action_time_mlp).
 
-        Following MoE design: each expert only has independent lm_expert,
-        action_in_proj, action_out_proj. Other components are shared.
+        Following MoE design: each expert has independent:
+        - lm_expert: action planning transformer
+        - action_in_proj: noisy action encoding
+        - action_out_proj: action output projection
+        - action_time_mlp_in/out: time encoding for Flow Matching
+
+        Shared components (loaded once in base_policy):
+        - VLM (SigLIP + text backbone)
+        - state_proj
+
+        Also loads expert-specific preprocessor and postprocessor for correct
+        normalization/denormalization stats.
         """
         checkpoint_path = Path(checkpoint_path)
 
@@ -274,10 +288,14 @@ class MoESmolVLAPolicy(BasePolicy):
         full_policy.eval()
 
         # Extract expert-specific components
+        # Note: action_time_mlp_in/out are always trainable (no config flag to freeze them)
+        # so each expert checkpoint contains different weights for them
         expert_components = {
             'lm_expert': copy.deepcopy(full_policy.model.vlm_with_expert.lm_expert),
             'action_in_proj': copy.deepcopy(full_policy.model.action_in_proj),
             'action_out_proj': copy.deepcopy(full_policy.model.action_out_proj),
+            'action_time_mlp_in': copy.deepcopy(full_policy.model.action_time_mlp_in),
+            'action_time_mlp_out': copy.deepcopy(full_policy.model.action_time_mlp_out),
         }
 
         # Move to device and freeze
@@ -286,75 +304,46 @@ class MoESmolVLAPolicy(BasePolicy):
             for param in component.parameters():
                 param.requires_grad = False
 
+        # Load expert-specific preprocessor and postprocessor (for normalization stats)
+        expert_components['preprocessor'] = self._load_expert_preprocessor(checkpoint_path)
+        expert_components['postprocessor'] = self._load_expert_postprocessor(checkpoint_path)
+
         logger.info(f"✅ Loaded expert components for {garment_type}")
 
         return expert_components
 
-    def _reconstruct_lm_expert(self, state_dict: Dict[str, torch.Tensor]) -> nn.Module:
-        """Reconstruct lm_expert from state dict components."""
-        # Get configuration from base model
-        num_layers = len(self.vlm_with_expert.lm_expert.layers)
-
-        # Create module list for layers
-        layers = nn.ModuleList()
-
-        for i in range(num_layers):
-            layer_state = {}
-            for key, param in state_dict.items():
-                if key.startswith(f"layers.{i}."):
-                    new_key = key.replace(f"layers.{i}.", "")
-                    layer_state[new_key] = param
-
-            # Reconstruct single layer
-            if layer_state:
-                layer = self._create_layer_from_state_dict(layer_state)
-                layers.append(layer)
-
-        # Create lm_expert module
-        lm_expert = nn.Module()
-        lm_expert.layers = layers
-
-        # Load state dict
-        lm_expert.load_state_dict(state_dict, strict=False)
-
-        return lm_expert
-
-    def _create_layer_from_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> nn.Module:
-        """Create a transformer layer from state dict."""
-        # This is a simplified version - actual implementation may vary
-        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-
-        # Get hidden size from state dict
-        if "self_attn.q_proj.weight" in state_dict:
-            hidden_size = state_dict["self_attn.q_proj.weight"].shape[1]
-            num_heads = 8  # Default for SmolVLM
-
-        # Create layer
-        layer = LlamaDecoderLayer(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            intermediate_size=hidden_size * 4,
-        )
-
-        layer.load_state_dict(state_dict, strict=False)
-        return layer
-
-    def _create_module_from_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> nn.Module:
-        """Create a simple module (Linear or MLP) from state dict."""
-        if not state_dict:
+    def _load_expert_preprocessor(self, checkpoint_path: Path):
+        """Load preprocessor with expert-specific normalization stats."""
+        from lerobot.processor import PolicyProcessorPipeline
+        try:
+            preprocessor = PolicyProcessorPipeline.from_pretrained(
+                pretrained_model_name_or_path=str(checkpoint_path),
+                config_filename="policy_preprocessor.json",
+                overrides={"device_processor": {"device": str(self.device)}},
+            )
+            logger.info(f"  ✅ Loaded preprocessor for {checkpoint_path.name}")
+            return preprocessor
+        except Exception as e:
+            logger.warning(f"  ⚠️ Failed to load preprocessor: {e}, using base policy's preprocessor")
             return None
 
-        # Check if it's a single linear layer
-        if "weight" in state_dict and len(state_dict) <= 2:
-            in_features = state_dict["weight"].shape[1] if len(state_dict["weight"].shape) == 2 else state_dict["weight"].shape[0]
-            out_features = state_dict["weight"].shape[0] if len(state_dict["weight"].shape) == 2 else 1
-
-            module = nn.Linear(in_features, out_features)
-            module.load_state_dict(state_dict, strict=False)
-            return module
-
-        # Otherwise, treat as MLP
-        return None
+    def _load_expert_postprocessor(self, checkpoint_path: Path):
+        """Load postprocessor with expert-specific denormalization stats."""
+        from lerobot.processor import PolicyProcessorPipeline
+        from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+        try:
+            postprocessor = PolicyProcessorPipeline.from_pretrained(
+                pretrained_model_name_or_path=str(checkpoint_path),
+                config_filename="policy_postprocessor.json",
+                overrides={"device_processor": {"device": "cpu"}},
+                to_transition=policy_action_to_transition,
+                to_output=transition_to_policy_action,
+            )
+            logger.info(f"  ✅ Loaded postprocessor for {checkpoint_path.name}")
+            return postprocessor
+        except Exception as e:
+            logger.warning(f"  ⚠️ Failed to load postprocessor: {e}, using base policy's postprocessor")
+            return None
 
     def _load_router(self, checkpoint_path: str) -> nn.Module:
         """Load trained router classifier."""
@@ -528,8 +517,8 @@ class MoESmolVLAPolicy(BasePolicy):
     ) -> np.ndarray:
         """Select action using the specified expert.
 
-        Uses base_policy's infrastructure (handles language tokens correctly)
-        but swaps in the expert's lm_expert and action projections.
+        Uses expert-specific preprocessor/postprocessor for correct normalization,
+        and swaps in the expert's lm_expert, action projections, and action_time_mlp.
         """
         if garment_type not in self.experts:
             raise ValueError(f"Expert for {garment_type} not available!")
@@ -540,22 +529,54 @@ class MoESmolVLAPolicy(BasePolicy):
         original_lm_expert = self.base_policy.model.vlm_with_expert.lm_expert
         original_action_in_proj = self.base_policy.model.action_in_proj
         original_action_out_proj = self.base_policy.model.action_out_proj
+        original_action_time_mlp_in = self.base_policy.model.action_time_mlp_in
+        original_action_time_mlp_out = self.base_policy.model.action_time_mlp_out
 
         # Temporarily swap in expert components
         self.base_policy.model.vlm_with_expert.lm_expert = expert_components['lm_expert']
         self.base_policy.model.action_in_proj = expert_components['action_in_proj']
         self.base_policy.model.action_out_proj = expert_components['action_out_proj']
+        self.base_policy.model.action_time_mlp_in = expert_components['action_time_mlp_in']
+        self.base_policy.model.action_time_mlp_out = expert_components['action_time_mlp_out']
+
+        # CRITICAL: Each expert was trained with different dataset stats.
+        # We MUST use the expert's preprocessor/postprocessor for correct normalization.
+        # Falling back to base_policy's preprocessor would use WRONG stats!
+        expert_preprocessor = expert_components.get('preprocessor')
+        expert_postprocessor = expert_components.get('postprocessor')
+
+        # Validate that expert has preprocessor - without it, normalization will be wrong!
+        if expert_preprocessor is None:
+            logger.error(f"❌ CRITICAL: Expert {garment_type} has NO preprocessor!")
+            logger.error(f"   Cannot normalize observation correctly - this will cause wrong actions!")
+            raise ValueError(
+                f"Expert {garment_type} missing preprocessor. "
+                f"Each expert must have its own preprocessor with correct normalization stats. "
+                f"Check if 'policy_preprocessor.json' exists in the expert checkpoint."
+            )
+
+        if expert_postprocessor is None:
+            logger.error(f"❌ CRITICAL: Expert {garment_type} has NO postprocessor!")
+            logger.error(f"   Cannot denormalize action correctly - this will cause wrong actions!")
+            raise ValueError(
+                f"Expert {garment_type} missing postprocessor. "
+                f"Each expert must have its own postprocessor with correct denormalization stats. "
+                f"Check if 'policy_postprocessor.json' exists in the expert checkpoint."
+            )
+
+        logger.info(f"✅ [{garment_type}] Using expert preprocessor/postprocessor with correct normalization stats")
 
         try:
-            # Use base_policy's select_action (handles language tokens correctly)
             with torch.no_grad():
-                # Prepare observation using base_policy's preprocessing
-                batch_obs = self._prepare_batch_for_base_policy(observation_dict)
+                # Always use expert's preprocessor (validated above)
+                batch_obs = self._prepare_batch_with_preprocessor(
+                    observation_dict, expert_preprocessor
+                )
+
                 batch_action = self.base_policy.select_action(batch_obs)
 
-                # Postprocess if available
-                if hasattr(self.base_policy, 'postprocessor') and self.base_policy.postprocessor is not None:
-                    batch_action = self.base_policy.postprocessor(batch_action)
+                # Always use expert's postprocessor (validated above)
+                batch_action = expert_postprocessor(batch_action)
 
             # Convert to numpy
             action = batch_action.squeeze(0).cpu().numpy()
@@ -565,8 +586,59 @@ class MoESmolVLAPolicy(BasePolicy):
             self.base_policy.model.vlm_with_expert.lm_expert = original_lm_expert
             self.base_policy.model.action_in_proj = original_action_in_proj
             self.base_policy.model.action_out_proj = original_action_out_proj
+            self.base_policy.model.action_time_mlp_in = original_action_time_mlp_in
+            self.base_policy.model.action_time_mlp_out = original_action_time_mlp_out
 
         return action
+
+    def _prepare_batch_with_preprocessor(
+        self,
+        obs_dict: Dict[str, np.ndarray],
+        preprocessor
+    ) -> Dict[str, torch.Tensor]:
+        """Prepare observation using a specific preprocessor (handles language tokens)."""
+        from lerobot.processor.core import TransitionKey
+
+        # Prepare tensors for preprocessor
+        obs_for_preproc = {}
+        for key, value in obs_dict.items():
+            if not key.startswith("observation."):
+                continue
+
+            if isinstance(value, np.ndarray):
+                value_tensor = torch.from_numpy(value).float()
+                if value.ndim == 3 and value.shape[-1] == 3:  # Image: (H, W, C)
+                    value_tensor = value_tensor.permute(2, 0, 1).to(self.device) / 255.0
+                    obs_for_preproc[key] = value_tensor.unsqueeze(0)
+                else:
+                    obs_for_preproc[key] = value_tensor.unsqueeze(0)
+
+        # Map camera keys: LeHome uses top_rgb/left_rgb/right_rgb,
+        # but preprocessor expects camera1/camera2/camera3
+        camera_key_mapping = {
+            'observation.images.top_rgb': 'observation.images.camera1',
+            'observation.images.left_rgb': 'observation.images.camera2',
+            'observation.images.right_rgb': 'observation.images.camera3',
+        }
+
+        # Apply mapping if source keys exist
+        for old_key, new_key in camera_key_mapping.items():
+            if old_key in obs_for_preproc:
+                obs_for_preproc[new_key] = obs_for_preproc[old_key]
+
+        # Create transition with task description
+        dummy_action = torch.zeros(1, 12, dtype=torch.float32, device=self.device)
+        transition = {
+            TransitionKey.OBSERVATION: obs_for_preproc,
+            TransitionKey.ACTION: dummy_action,
+            TransitionKey.COMPLEMENTARY_DATA: {"task": self.task_description},
+        }
+
+        # Use the provided preprocessor (handles language tokens)
+        transformed = preprocessor._forward(transition)
+        batch_obs = preprocessor.to_output(transformed)
+
+        return batch_obs
 
     def _prepare_transition(self, obs_dict: Dict[str, np.ndarray]) -> Dict:
         """Prepare observation in LeRobot transition format."""
@@ -594,24 +666,6 @@ class MoESmolVLAPolicy(BasePolicy):
             TransitionKey.COMPLEMENTARY_DATA: {"task": self.task_description},
         }
         return transition
-
-    def _prepare_batch_observation(self, obs_dict: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
-        """Prepare observation in simple batch format (fallback)."""
-        batch_obs = {}
-
-        for key, value in obs_dict.items():
-            if not key.startswith("observation."):
-                continue
-
-            if isinstance(value, np.ndarray):
-                value_tensor = torch.from_numpy(value).float()
-                if value.ndim == 3 and value.shape[-1] == 3:  # Image: (H, W, C)
-                    value_tensor = value_tensor.permute(2, 0, 1).to(self.device) / 255.0
-                    batch_obs[key] = value_tensor.unsqueeze(0)
-                else:
-                    batch_obs[key] = value_tensor.unsqueeze(0)
-
-        return batch_obs
 
     def _prepare_batch_for_base_policy(self, obs_dict: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """Prepare observation using base_policy's preprocessor (handles language tokens)."""

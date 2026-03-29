@@ -3,3 +3,89 @@ python scripts/dataset/merge_subdatasets.py \
       --output Datasets/pant_long_merged \
       --repo_id pant_long_merged \
       --drop_features observation.top_depth
+
+# Test if SmolVLANewLineProcessor is registered in the registry
+python3 -c "
+from lerobot.policies.smolvla.processor_smolvla import SmolVLANewLineProcessor
+from lerobot.processor import ProcessorStepRegistry
+print('Available steps:', list(ProcessorStepRegistry._registry.keys()))
+"
+
+# Test if preprocessor loads correctly for pant_long expert
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python3 -c "
+from lerobot.policies.smolvla.processor_smolvla import SmolVLANewLineProcessor
+from lerobot.processor import PolicyProcessorPipeline
+try:
+    p = PolicyProcessorPipeline.from_pretrained(
+        'outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/009000/pretrained_model',
+        config_filename='policy_preprocessor.json',
+        overrides={'device_processor': {'device': 'cpu'}}
+    )
+    print('✅ Preprocessor loaded successfully!')
+except Exception as e:
+    print(f'❌ Failed: {e}')
+    import traceback
+    traceback.print_exc()
+"
+
+# MoE evaluation commands
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
+    --policy_type moe_smolvla \
+    --garment_type "pant_short" \
+    --num_episodes 1 \
+    --max_steps 600 \
+    --enable_cameras \
+    --headless \
+    --device cpu
+
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
+    --policy_type moe_smolvla \
+    --garment_type "pant_long" \
+    --num_episodes 1 \
+    --max_steps 600 \
+    --enable_cameras \
+    --headless \
+    --device cpu
+
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
+    --policy_type moe_smolvla \
+    --garment_type "top_long" \
+    --num_episodes 1 \
+    --max_steps 600 \
+    --enable_cameras \
+    --headless \
+    --device cpu
+
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
+    --policy_type moe_smolvla \
+    --garment_type "top_short" \
+    --num_episodes 1 \
+    --max_steps 600 \
+    --enable_cameras \
+    --headless \
+    --device cpu
+
+# Single expert evaluation (for comparison)
+python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/moe_train/smolvla_moe_expert_top_long_no_st_proj/checkpoints/011000/pretrained_model/ \
+    --dataset_root Datasets/example/top_long_merged \
+    --garment_type "top_long" \
+    --num_episodes 5 \
+    --max_steps 600 \
+    --enable_cameras \
+    --device cpu \
+    --headless \
+    --task_description "fold the garment on the table"
+
+python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/moe_train/smolvla_moe_expert_top_long_no_st_proj/checkpoints/011000/pretrained_model/ \
+    --dataset_root Datasets/example/top_long_merged \
+    --garment_type "top_long" \
+    --num_episodes 5 \
+    --max_steps 600 \
+    --enable_cameras \
+    --device cpu \
+    --headless \
+    --task_description "fold the garment on the table"

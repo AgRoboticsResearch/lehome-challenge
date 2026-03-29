@@ -49,12 +49,14 @@ def clean_episodes_table(table: pa.Table, rm_col_name: str) -> pa.Table:
         print(f"   ✂️  [Episodes] Removing {len(cols_to_drop)} depth-related statistics columns...")
         table = table.drop(cols_to_drop)
 
-    # 2. Find all file index columns (ending with /file_index or /chunk_index)
-    # Since we merge all data into file-000, these must all be reset to 0
+    # 2. Find data/meta file index columns (NOT video file indices)
+    # Since we merge all data into file-000, only reset data/meta indices
+    # Video file indices should be preserved for multi-file video datasets
     index_cols = [
         c
         for c in table.column_names
-        if c.endswith("/file_index") or c.endswith("/chunk_index")
+        if (c.endswith("/file_index") or c.endswith("/chunk_index"))
+        and not c.startswith("videos/")
     ]
 
     if index_cols:
