@@ -58,7 +58,13 @@ cd ../..
 ```
 
 ### Download Checkpoints
-Download the checkpoint folders from the provided HuggingFace repo and place them under `outputs/moe_train/`:
+Download from [HuggingFace](https://huggingface.co/datasets/linsheng888/lehome-challenge-brl-sroi):
+
+```bash
+huggingface-cli download linsheng888/lehome-challenge-brl-sroi --repo-type dataset --local-dir outputs/moe_train
+```
+
+Expected directory structure:
 ```
 outputs/moe_train/
   smolvla_moe_expert_pant_short_no_st_proj/checkpoints/011000/pretrained_model/
