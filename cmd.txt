@@ -1,34 +1,478 @@
-python scripts/dataset/merge_subdatasets.py \
-      --source Datasets/pant_long_newdata_0329 \
-      --output Datasets/pant_long_merged \
-      --repo_id pant_long_merged \
-      --drop_features observation.top_depth
+# ==============================================================================
+# LeHome Challenge - 常用命令
+# ==============================================================================
 
-# Test if SmolVLANewLineProcessor is registered in the registry
-python3 -c "
-from lerobot.policies.smolvla.processor_smolvla import SmolVLANewLineProcessor
-from lerobot.processor import ProcessorStepRegistry
-print('Available steps:', list(ProcessorStepRegistry._registry.keys()))
+# -----------------------------------------------------------------------------
+# 1. 训练命令 (Training)
+# -----------------------------------------------------------------------------
+
+# ACT Policy 训练
+lerobot-train --config_path=configs/train_act.yaml
+
+# Diffusion Policy 训练
+lerobot-train --config_path=configs/train_dp.yaml
+
+# SmolVLA Policy 训练
+lerobot-train --config_path=configs/train_smolvla.yaml
+
+# MoE-SmolVLA Policy 训练
+lerobot-train --config_path=configs/train_smolvla_moe_expert_pant_long.yaml
+
+# SmolVLA Pant Short 训练 (后台模式)
+nohup lerobot-train --config_path=configs/train_smolvla_pant_short.yaml > train_pant_short.log 2>&1 &
+
+# 自定义数据集训练 (修改配置文件中的 dataset.root 和 output_dir)
+# cp configs/train_act.yaml configs/train_act_custom.yaml
+# # 编辑 configs/train_act_custom.yaml
+# lerobot-train --config_path=configs/train_act_custom.yaml
+
+# -----------------------------------------------------------------------------
+# 2. 评估命令 (Evaluation) - 使用已训练的 Policy
+# -----------------------------------------------------------------------------
+
+
+# SmolVLA Policy 评估 (带 task_description)
+python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/train/smolvla_top_long/checkpoints/030000/pretrained_model \
+    --dataset_root Datasets/example/top_long_merged \
+    --garment_type "top_long" \
+    --num_episodes 5 \
+    --max_steps 600 \
+    --enable_cameras \
+    --device cpu \
+    --headless \
+    --task_description "fold the garment on the table"
+
+# 自定义 Policy 评估
+python -m scripts.eval \
+    --policy_type custom \
+    --garment_type "top_long" \
+    --num_episodes 5 \
+    --enable_cameras \
+    --device cpu \
+    --headless
+
+# -----------------------------------------------------------------------------
+# 2.1 Four Types Policy 评估 (训练于所有服装类型)
+# -----------------------------------------------------------------------------
+
+# ACT Four Types 评估 - top_long (带视频保存)
+python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/train/act_four_types/checkpoints/100000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
+    --garment_type "top_long" \
+    --num_episodes 5 \
+    --max_steps 600 \
+    --enable_cameras \
+    --device cpu \
+    --headless \
+    --save_video \
+    --video_dir outputs/eval_videos/act_four_types/top_long
+
+# ACT Four Types 评估 - top_long (不带视频保存)
+python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/train/act_four_types/checkpoints/100000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
+    --garment_type "top_long" \
+    --num_episodes 5 \
+    --max_steps 600 \
+    --enable_cameras \
+    --device cpu \
+    --headless \
+
+
+# ACT Four Types 评估 - pant_long (带视频保存)
+python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/train/act_four_types/checkpoints/100000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
+    --garment_type "pant_long" \
+    --num_episodes 5 \
+    --max_steps 600 \
+    --enable_cameras \
+    --device cpu \
+    --headless \
+    --save_video \
+    --video_dir outputs/eval_videos/act_four_types/pant_long
+# -----------------------------------------------------------------------------
+# 3. 数据集操作 (Dataset Operations) - 无需 Isaac Sim
+# -----------------------------------------------------------------------------
+
+# 查看数据集信息
+python -m scripts.dataset inspect --dataset_root Datasets/example/top_long_merged
+
+# 读取数据集状态
+python -m scripts.dataset read --dataset_root Datasets/example/top_long_merged --num_frames 100
+
+# 合并数据集
+python -c "
+from pathlib import Path
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.dataset_tools import merge_datasets
+datasets = [LeRobotDataset(f'ds_{i:03d}', root=Path('Datasets/record')) for i in range(1, 4)]
+merged = merge_datasets(datasets, 'merged', Path('Datasets/example/merged'))
 "
 
-# Test if preprocessor loads correctly for pant_long expert
-TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python3 -c "
-from lerobot.policies.smolvla.processor_smolvla import SmolVLANewLineProcessor
-from lerobot.processor import PolicyProcessorPipeline
-try:
-    p = PolicyProcessorPipeline.from_pretrained(
-        'outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/009000/pretrained_model',
-        config_filename='policy_preprocessor.json',
-        overrides={'device_processor': {'device': 'cpu'}}
-    )
-    print('✅ Preprocessor loaded successfully!')
-except Exception as e:
-    print(f'❌ Failed: {e}')
-    import traceback
-    traceback.print_exc()
-"
+# 添加 end-effector pose 到数据集
+python -m scripts.dataset augment \
+    --dataset_root Datasets/record/001 \
+    --urdf_path Assets/robots/so101_new_calib.urdf \
+    --state_unit rad
 
-# MoE evaluation commands
+# -----------------------------------------------------------------------------
+# 4. 数据集录制/回放 (Dataset Record/Replay) - 需要 Isaac Sim
+# -----------------------------------------------------------------------------
+
+# 录制数据集 - SO101 Leader Arms
+python -m scripts.dataset_sim record \
+    --teleop_device bi-so101leader \
+    --garment_name Top_Long_Unseen_0 \
+    --enable_record \
+    --num_episode 10 \
+    --device cpu \
+    --enable_cameras
+
+# 录制数据集 - Keyboard (双臂)
+python -m scripts.dataset_sim record \
+    --teleop_device bi-keyboard \
+    --garment_name Top_Long_Unseen_0 \
+    --enable_record \
+    --num_episode 10 \
+    --device cpu \
+    --enable_cameras
+
+# 回放数据集
+python -m scripts.dataset_sim replay \
+    --dataset_root Datasets/example/top_long_merged \
+    --device cpu \
+    --enable_cameras
+
+# 回放数据集 (带保存)
+python -m scripts.dataset_sim replay \
+    --dataset_root Datasets/example/top_long_merged \
+    --output_root Datasets/replay_output \
+    --num_replays 1 \
+    --device cpu \
+    --enable_cameras
+
+# -----------------------------------------------------------------------------
+# 5. GPU 监控 (GPU Monitoring)
+# -----------------------------------------------------------------------------
+
+# 实时监控 GPU 状态
+watch -n 1 nvidia-smi
+
+# 查看 GPU 详细信息
+nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total --format=csv
+
+# -----------------------------------------------------------------------------
+# 6. 常用参数说明
+# -----------------------------------------------------------------------------
+
+# --policy_type: Policy 类型 (lerobot, custom)
+# --policy_path: 模型路径 (LeRobot policy 必需)
+# --dataset_root: 数据集路径 (LeRobot policy 必需，用于 metadata)
+# --garment_type: 服装类型 (top_long, top_short, pant_long, pant_short, custom)
+# --num_episodes: 每个 garment 的 episode 数量 (默认: 5)
+# --max_steps: 每个 episode 的最大步数 (默认: 600)
+# --enable_cameras: 启用相机渲染
+# --device: 模拟设备 (cpu 必需，避免服装物理问题)
+# --headless: 无 GUI 模式
+# --save_video: 保存评估视频
+# --video_dir: 视频保存目录
+# --task_description: 任务描述 (VLA models 需要)
+
+# -----------------------------------------------------------------------------
+# 7. Garment 类型对照
+# -----------------------------------------------------------------------------
+
+# garment_type          文件夹路径
+# ========================================
+# top_long      -> Assets/objects/Challenge_Garment/Release/Top_Long/
+# top_short     -> Assets/objects/Challenge_Garment/Release/Top_Short/
+# pant_long     -> Assets/objects/Challenge_Garment/Release/Pant_Long/
+# pant_short    -> Assets/objects/Challenge_Garment/Release/Pant_Short/
+# custom        -> 使用自定义路径
+
+# -----------------------------------------------------------------------------
+# 8. 环境激活
+# -----------------------------------------------------------------------------
+
+# 激活虚拟环境
+source .venv/bin/activate
+
+# 或使用 uv 运行
+uv run lerobot-train --config_path=configs/train_act.yaml
+uv run python -m scripts.eval --help
+
+# -----------------------------------------------------------------------------
+# 9. 训练配置文件修改模板
+# -----------------------------------------------------------------------------
+
+# 修改 batch_size 以优化训练速度
+# batch_size: 16    # 默认 (适合 16GB 显存)
+# batch_size: 32    # SmolVLA 推荐
+# batch_size: 64    # A100/40GB 可尝试
+
+# 修改输出目录
+# output_dir: outputs/train/act_top_long
+# output_dir: outputs/train/diffusion_pant_short
+# output_dir: outputs/train/smolvla_custom
+
+# 启用 WandB 日志
+# wandb:
+#   enable: true
+#   project: lehome-challenge
+#   name: experiment_name
+
+# -----------------------------------------------------------------------------
+# 10. Mihomo 代理设置 (Mihomo Proxy Setup)
+# -----------------------------------------------------------------------------
+
+# Mihomo 代理为每个服务器提供独立的本地外部访问（pip, git, curl 等）
+# 每个服务器运行自己的 mihomo 实例在 127.0.0.1:7897
+
+# 进入 mihomo 设置目录
+cd scripts/mihomo-setup
+
+# 列出所有服务器
+./deploy_to_server.sh list
+
+# 部署到单个服务器
+./deploy_to_server.sh zjuici      # ZJUICI 远程服务器 (有 sudo)
+./deploy_to_server.sh lan102      # LAN 102 (无 sudo, 用户安装)
+./deploy_to_server.sh lan103      # LAN 103 (无 sudo, 用户安装)
+./deploy_to_server.sh lan104      # LAN 104 (无 sudo, 用户安装)
+./deploy_to_server.sh lan206      # LAN 206 (无 sudo, 用户安装)
+./deploy_to_server.sh lan120      # LAN 120 (无 sudo, 用户安装)
+
+# 部署到所有服务器
+./deploy_to_server.sh all
+
+# 检查所有服务器状态
+./check_status.sh
+
+# 检查特定服务器状态
+./check_status.sh lan102
+./check_status.sh lan102 --details
+
+# 在服务器上测试代理
+ssh -p 31329 admin@pool.zjuici.com 'curl -x http://127.0.0.1:7897 https://api.ipify.org'  # ZJUICI
+ssh -p 22 hls@192.168.3.102 'curl -x http://127.0.0.1:7897 https://api.ipify.org'       # LAN 服务器
+
+# 在服务器上启用代理（用于 pip, git, curl 等）
+ssh -p 22 hls@192.168.3.102
+source proxy_on          # 启用代理
+curl https://api.ipify.org  # 测试
+pip install torch        # 通过代理安装
+source proxy_off         # 禁用代理
+
+# 或使用 sync.sh 的集成命令（从项目根目录）
+./scripts/sync.sh proxy-on lan102      # 启用 lan102 代理
+./scripts/sync.sh proxy-off lan102     # 禁用 lan102 代理
+./scripts/sync.sh proxy-status lan102  # 查看 lan102 mihomo 状态
+
+# Mihomo 服务管理（在服务器上运行）
+mihomoctl start         # 启动服务
+mihomoctl stop          # 停止服务
+mihomoctl restart       # 重启服务
+mihomoctl status        # 查看状态
+mihomoctl logs          # 查看日志
+mihomoctl reload        # 重载配置
+
+# Web UI 仪表板（需要 SSH 隧道）
+# 对于 ZJUICI:
+ssh -L 9099:127.0.0.1:9090 -L 7897:127.0.0.1:7897 -p 31329 admin@pool.zjuici.com
+open http://yacd.haishan.me/#/setup?hostname=127.0.0.1&port=9099
+
+# 对于 LAN 服务器:
+ssh -L 9099:127.0.0.1:9090 -L 7897:127.0.0.1:7897 -p 22 hls@192.168.3.102
+open http://yacd.haishan.me/#/setup?hostname=127.0.0.1&port=9099
+
+# 代理端口和配置
+# HTTP/SOCKS5 代理: 127.0.0.1:7897
+# API 端口: 127.0.0.1:9090
+# 配置文件:
+#   - 有 sudo: /opt/mihomo/config.yaml
+#   - 无 sudo: ~/.mihomo/config.yaml
+# 日志文件:
+#   - 有 sudo: /opt/mihomo/logs/mihomo.log
+#   - 无 sudo: ~/.mihomo/mihomo.log
+
+# -----------------------------------------------------------------------------
+# 11. 多服务器同步 (Multi-Server Sync with Proxy Integration)
+# -----------------------------------------------------------------------------
+
+# 使用 sync.sh 同步代码到所有服务器（支持 mihomo 集成）
+cd /Users/moky/codes/lehome-challenge  # 回到项目根目录
+
+# 同步命令
+./scripts/sync.sh push              # 推送到默认服务器 (zjuici)
+./scripts/sync.sh push lan102       # 推送到 lan102
+./scripts/sync.sh pull lan103       # 从 lan103 拉取
+./scripts/sync.sh datasets lan102   # 推送数据集到 lan102
+./scripts/sync.sh outputs lan102    # 从 lan102 拉取训练输出
+./scripts/sync.sh exec lan102       # SSH 到 lan102
+
+# 代理管理命令
+./scripts/sync.sh proxy-on lan102   # 在 lan102 启用 mihomo 代理
+./scripts/sync.sh proxy-off lan102  # 在 lan102 禁用 mihomo 代理
+./scripts/sync.sh proxy-status lan102  # 查看 lan102 mihomo 状态
+
+# 支持的服务器
+# zjuici  - ZJUICI 远程服务器 (admin@pool.zjuici.com:31329) [有 sudo]
+# lan102  - LAN 192.168.3.102 (hls@192.168.3.102:22) [无 sudo]
+# lan103  - LAN 192.168.3.103 (hls@192.168.3.103:22) [无 sudo]
+# lan104  - LAN 192.168.3.104 (hls@192.168.3.104:22) [无 sudo]
+# lan206  - LAN 192.168.3.206 (hls@192.168.3.206:22) [无 sudo]
+# lan120  - LAN 192.168.3.120 (hls@192.168.3.120:22) [无 sudo]
+
+# -----------------------------------------------------------------------------
+# 12. rsync 数据同步 (Remote Sync - 传统方式)
+# -----------------------------------------------------------------------------
+#
+# 推荐使用 ./scripts/sync.sh 替代以下命令
+# sync.sh 支持多服务器配置、代理集成、自动排除规则等
+#
+# -----------------------------------------------------------------------------
+
+# 从远程服务器下载评估视频
+rsync -avz --progress \
+    -e "ssh -p 31329" \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/outputs/eval_videos \
+    ./eval_videos
+
+# 从远程服务器下载训练输出
+rsync -avz --progress \
+    -e "ssh -p 31329" \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/outputs/train \
+    ./train_outputs
+
+# 从远程服务器下载整个项目
+rsync -avz --progress \
+    -e "ssh -p 31329" \
+    --exclude 'outputs/train' \
+    --exclude 'outputs/eval_videos' \
+    --exclude 'Datasets' \
+    --exclude '.venv' \
+    --exclude '.venv-pi' \
+    --exclude '__pycache__' \
+    --exclude 'Assets' \
+    --exclude 'third_party' \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge \
+    ./lehome-challenge
+
+# 上传本地训练好的模型到服务器
+rsync -avz --progress \
+    -e "ssh -p 31329" \
+    outputs/train/act_top_long \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/outputs/train/
+
+
+rsync -avz --progress \
+    -e "ssh -p 31329" \
+    Datasets/pant_long_evo_rl_merged_fixed_v3 \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/Datasets/
+
+
+# 上传本地数据集到服务器
+rsync -avz --progress \
+    -e "ssh -p 31329" \
+    Datasets/custom_dataset \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/Datasets/
+
+# rsync 参数说明
+# -a: 归档模式，保留文件属性
+# -v: 详细输出
+# -z: 压缩传输
+# --progress: 显示传输进度
+# -e: 指定 SSH 命令（端口等）
+# --exclude: 排除某些文件/目录
+
+# 只同步更新的文件（增量同步）
+rsync -avz --progress --update \
+    -e "ssh -p 31329" \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/outputs/eval_videos \
+    ./eval_videos
+
+# 删除本地不存在于远程的文件（镜像同步）
+rsync -avz --progress --delete \
+    -e "ssh -p 31329" \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/outputs/eval_videos \
+    ./eval_videos
+
+# 同步特定文件类型
+rsync -avz --progress \
+    -e "ssh -p 31329" \
+    --include="*.mp4" --include="*/" --exclude="*" \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/scripts/ \
+    ./scripts/
+
+
+rsync -avz --progress -e "ssh -p 31329" \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/outputs/eval_reports/ \
+    ./outputs/eval_reports/
+
+rsync -avz --progress -e "ssh -p 31329" \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/docs/ \
+    ./docs/
+
+ rsync -avz --progress -e "ssh -p 31329" \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/outputs/eval_videos/ \
+    ./outputs/eval_videos/
+
+ rsync -avz --progress -e "ssh -p 31329" \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/outputs/train/smolvla_pant_short/checkpoints/009000 \
+    ./outputs/train/smolvla_pant_short/checkpoints/
+
+ rsync -avz --progress -e "ssh -p 31329" \
+    admin@pool.zjuici.com:/tmp/ \
+    ./tmp/
+
+ rsync -avz --progress -e "ssh -p 31329" \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/outputs/train/smolvla_four_types \
+    ./outputs/train/
+
+  CUDA_VISIBLE_DEVICES=1 ./scripts/eval_checkpoints.sh \
+      --model smolvla_moe_expert_top_long \
+      --dataset_root Datasets/example/top_long_merged \
+      --garment_type top_long \
+      --min_steps
+
+nohup lerobot-train --config_path=configs/train_smolvla_moe_expert_top_long.yaml > train.log 2>&1 &
+
+ CUDA_VISIBLE_DEVICES=1 ./scripts/eval_checkpoints.sh \
+      --model smolvla_moe_expert_top_short \
+      --dataset_root Datasets/example/top_short_merged \
+      --garment_type top_short 
+
+ TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 ./scripts/eval_checkpoints.sh \
+      --model smolvla_moe_expert_top_short \
+      --dataset_root Datasets/example/top_short_merged \
+      --garment_type top_short
+
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 ./scripts/eval_checkpoints.sh \
+      --model smolvla_moe_expert_pant_long_0329 \
+      --dataset_root Datasets/example/pant_long_merged \
+      --garment_type pant_long
+
+
+ TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 ./scripts/eval_checkpoints.sh \
+      --model smolvla_moe_expert_top_short_no_st_proj \
+      --dataset_root Datasets/example/top_short_merged \
+      --garment_type top_short \
+      --checkpoint_min 9000
+
+ TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 ./scripts/eval_checkpoints.sh \
+      --model smolvla_moe_expert_top_long_no_st_proj \
+      --dataset_root Datasets/example/top_long_merged \
+      --garment_type top_long \
+      --checkpoint_min 1000
+
+
 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
     --policy_type moe_smolvla \
     --garment_type "pant_short" \
@@ -38,54 +482,301 @@ TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts
     --headless \
     --device cpu
 
-TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
-    --policy_type moe_smolvla \
+python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/moe_train/smolvla_moe_expert_top_long_no_st_proj/checkpoints/008000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
+    --garment_type "top_long" \
+    --num_episodes 5 \
+    --max_steps 600 \
+    --enable_cameras \
+    --device cpu \
+    --headless \
+    --save_datasets \
+    --eval_dataset_path Datasets/test_evo_rl \
+    --task_description "Fold the garment"
+
+
+CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/004000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
+    --garment_type "pant_long" \
+    --num_episodes 5 \
+    --max_steps 600 \
+    --enable_cameras \
+    --device cpu \
+    --headless \
+    --save_datasets \
+    --eval_dataset_path Datasets/test_evo_rl/pant_long \
+    --task_description "Fold the garment"
+
+
+DISPLAY=:1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/004000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
     --garment_type "pant_long" \
     --num_episodes 1 \
-    --max_steps 600 \
+    --max_steps 300 \
     --enable_cameras \
-    --headless \
-    --device cpu
+    --device cpu \
+    --save_datasets \
+    --eval_dataset_path Datasets/test_evo_rl/pant_long \
+    --task_description "Fold the garment"
 
-TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
-    --policy_type moe_smolvla \
-    --garment_type "top_long" \
-    --num_episodes 1 \
-    --max_steps 600 \
-    --enable_cameras \
-    --headless \
-    --device cpu
-
-TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
-    --policy_type moe_smolvla \
-    --garment_type "top_short" \
-    --num_episodes 1 \
-    --max_steps 600 \
-    --enable_cameras \
-    --headless \
-    --device cpu
-
-# Single expert evaluation (for comparison)
-python -m scripts.eval \
+CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
     --policy_type lerobot \
-    --policy_path outputs/moe_train/smolvla_moe_expert_top_long_no_st_proj/checkpoints/011000/pretrained_model/ \
-    --dataset_root Datasets/example/top_long_merged \
-    --garment_type "top_long" \
+    --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/004000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
+    --garment_type "pant_long" \
     --num_episodes 5 \
     --max_steps 600 \
     --enable_cameras \
     --device cpu \
     --headless \
-    --task_description "fold the garment on the table"
+    --save_datasets \
+    --save_mode all \
+    --eval_dataset_path Datasets/test_evo_rl/pant_long \
+    --task_description "Fold the garment"
 
-python -m scripts.eval \
+
+
+ CUDA_VISIBLE_DEVICES=0 lerobot-value-train \
+  --dataset.repo_id=Datasets/pant_long_evo_rl_merged_fixed \
+  --value.type=pistar06 \
+  --value.dtype=bfloat16 \
+  --value.camera_features="[observation.images.top_rgb,observation.images.left_rgb,observation.images.right_rgb]" \
+  --value.state_feature=observation.state \
+  --value.task_field=task \
+  --batch_size=32 \
+  --steps=8000 \
+  --output_dir=outputs/value_train_pant_long
+
+lerobot-value-train \
+  --dataset.repo_id=/home/hls/Datasets/pant_long_evo_rl_merged_fixed_v3 \
+  --value.type=pistar06 \
+  --value.vision_repo_id=google/siglip-so400m-patch14-384 \
+  --value.language_repo_id=google/gemma-3-270m \
+  --value.camera_features='["observation.images.top_rgb","observation.images.left_rgb","observation.images.right_rgb"]' \
+  --value.state_feature=observation.state \
+  --batch_size=2 \
+  --steps=8000 \
+  --num_workers=4
+
+ lerobot-value-train \
+    --dataset.repo_id=/home/admin/codes/lehome-challenge/Datasets/pant_long_evo_rl_smol_mix_merged \
+    --value.type=pistar06 \
+    --value.vision_repo_id=google/siglip-so400m-patch14-384 \
+    --value.language_repo_id=google/gemma-3-270m \
+    --value.camera_features='["observation.images.top_rgb","observation.images.left_rgb","observation.im
+  ages.right_rgb"]' \
+    --value.state_feature=observation.state \
+    --batch_size=6 \
+    --steps=80000 \
+    --num_workers=4 \
+    --wandb.enable=true \
+    --wandb.project=lehome-value-training
+
+lerobot-value-train \
+  --dataset.repo_id=/home/admin/codes/lehome-challenge/Datasets/pant_long_evo_rl_smol_mix_merged \
+  --value.type=pistar06 \
+  --value.vision_repo_id=google/siglip-so400m-patch14-384 \
+  --value.language_repo_id=google/gemma-3-270m \
+  --value.camera_features='["observation.images.top_rgb","observation.images.left_rgb","observation.images.right_rgb"]' \
+  --value.state_feature=observation.state \
+  --batch_size=6 \
+  --steps=80000 \
+  --num_workers=4 \
+  --value.optimizer_lr=1e-4 \
+  --value.scheduler_warmup_steps=1000 \
+  --value.scheduler_decay_steps=20000 \
+  --value.scheduler_decay_lr=1e-6 \
+  --wandb.enable=true \
+  --wandb.project=lehome-value-training
+
+
+python scripts/dataset/merge_evo_datasets.py \
+    --evo_root Datasets/pant_long_evo_rl \
+    --output Datasets/pant_long_evo_rl_merged
+
+
+ rsync -avz --progress -e "ssh -p 31329" \
+    Datasets/test_evo_rl \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/Datasets/
+
+ rsync -avz --progress -e "ssh -p 31329" \
+    outputs/moe_train \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/outputs/
+
+rsync -avz --progress \
+    -e "ssh -p 31329" \
+    admin@pool.zjuici.com:/home/admin/codes/lehome-challenge/Datasets/test_hil_manual\
+    ./Datasets/
+
+CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
     --policy_type lerobot \
-    --policy_path outputs/moe_train/smolvla_moe_expert_top_long_no_st_proj/checkpoints/011000/pretrained_model/ \
-    --dataset_root Datasets/example/top_long_merged \
-    --garment_type "top_long" \
-    --num_episodes 5 \
-    --max_steps 600 \
+    --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/004000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
+    --garment_type "pant_long" \
+    --num_episodes 1 \
+    --max_steps 300 \
+    --enable_cameras \
+    --device cpu \
+    --eval_dataset_path Datasets/test_evo_rl/pant_long \
+    --task_description "Fold the garment"
+
+# Run HIL evaluation
+CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/004000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
+    --garment_type "pant_long" \
+    --num_episodes 3 \
+    --max_steps 300 \
     --enable_cameras \
     --device cpu \
     --headless \
-    --task_description "fold the garment on the table"
+    --enable_hil \
+    --save_datasets \
+    --save_mode all \
+    --eval_dataset_path Datasets/hil_data/pant_long_01
+
+
+
+python -m scripts.dataset_sim record \
+    --teleop_device bi-so101leader \
+    --garment_name Top_Long_Unseen_0 \
+    --enable_record \
+    --num_episode 10 \
+    --device cpu \
+    --headless \
+    --enable_cameras
+
+# Quick test - check if pynput works (requires X server)
+cd /home/hls/codes/lehome-challenge
+python -c "from pynput.keyboard import Listener; print('pynput works')" 2>&1
+
+# Check DISPLAY variable
+echo "DISPLAY=$DISPLAY"
+
+# Test the actual imports to see real error
+python -c "
+import sys
+sys.path.insert(0, 'source/lehome')
+
+# Test pynput
+try:
+    from pynput.keyboard import Listener
+    print('✓ pynput OK')
+except Exception as e:
+    print(f'✗ pynput failed: {e}')
+
+# Test isaaclab
+try:
+    import isaaclab.sim as sim_utils
+    print('✓ isaaclab OK')
+except Exception as e:
+    print(f'✗ isaaclab failed: {e}')
+
+# Test BiSO101Leader
+try:
+    from lehome.devices.lerobot import BiSO101Leader
+    print(f'✓ BiSO101Leader = {BiSO101Leader}')
+except Exception as e:
+    print(f'✗ BiSO101Leader failed: {e}')
+" 2>&1
+
+# If you have X server (e.g., via SSH X forwarding), set DISPLAY
+export DISPLAY=:1
+
+# Then run your command
+python -m scripts.dataset_sim record \
+    --teleop_device bi-so101leader \
+    --garment_name Top_Long_Unseen_0 \
+    --enable_record \
+    --num_datasets 5 \
+    --num_episode 1 \
+    --device cpu \
+    --enable_cameras
+
+DISPLAY=:1 python -m scripts.dataset_sim record \
+    --teleop_device bi-so101leader \
+    --left_arm_port /dev/ttyACM0 \
+    --right_arm_port /dev/ttyACM1 \
+    --garment_name Pant_Long_Unseen_0 \
+    --enable_record \
+    --num_datasets 5 \
+    --num_episode 1 \
+    --device cpu \
+    --log_success \
+    --enable_cameras
+
+
+DISPLAY=:1 python -m scripts.dataset_sim record \
+    --teleop_device bi-so101leader \
+    --device "cpu" \
+    --recalibrate \
+    --enable_cameras
+
+
+# First test: Import check
+python -m scripts.test_so101_import
+
+# Second test: Connection test (reading only, no movement)
+python -m scripts.test_so101_connection \
+    --left_port /dev/ttyACM1 \
+    --right_port /dev/ttyACM0
+
+# Third test: Full test with send (arms will move!)
+python -m scripts.test_so101_manager \
+    --left_port /dev/ttyACM1 \
+    --right_port /dev/ttyACM0 \
+    --test_send
+
+
+# Test v2 (direct FeetechMotorsBus import, avoids pxr)
+DISPLAY=:1 python -m scripts.test_so101_connection \
+    --left_port /dev/ttyACM1 \
+    --right_port /dev/ttyACM0
+
+# OR test v3 (pySerial direct, bypasses scservo_sdk entirely)
+DISPLAY=:1 python -m scripts.test_so101_pyserial \
+    --left_port /dev/ttyACM1 \
+    --right_port /dev/ttyACM0
+
+DISPLAY=:1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/009000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
+    --garment_type "pant_long" \
+    --teleop_device bi-so101leader \
+    --left_arm_port /dev/ttyACM1 \
+    --right_arm_port /dev/ttyACM0 \
+    --device cpu \
+    --enable_hil \
+    --policy_sync_verbose \
+    --num_episodes 1
+
+
+DISPLAY=:1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python -m scripts.eval \
+      --policy_type lerobot \
+      --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/009000/pretrained_model \
+      --dataset_root Datasets/example/four_types_merged \
+      --garment_name Pant_Long_Unseen_0 \
+      --teleop_device bi-so101leader \
+      --left_arm_port /dev/ttyACM0 \
+      --right_arm_port /dev/ttyACM1 \
+      --device cpu \
+      --enable_hil \
+      --policy_sync_verbose \
+      --max_steps 1200 \
+      --num_episodes 1 \
+      --save_datasets \
+      --eval_dataset_path Datasets/record \
+      --save_mode all    
+
+
+exec su -l $USER
+
+python -m scripts.dataset inspect --dataset_root Datasets/record/pant_long_20260328_185934
