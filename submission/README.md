@@ -43,6 +43,18 @@ hf download lehome/asset_challenge --repo-type dataset --local-dir Assets
 
 # Download example datasets (for metadata)
 hf download lehome/dataset_challenge_merged --repo-type dataset --local-dir Datasets/example
+
+# Install submission source code
+cd submission/source_code
+
+LEROBOT_SMOLVLA=$(python -c "import lerobot.policies.smolvla; import os; print(os.path.dirname(lerobot.policies.smolvla.__file__))")
+cp lerobot_policies_smolvla/* "$LEROBOT_SMOLVLA/"
+
+EVAL_POLICY="../../scripts/eval_policy"
+cp scripts/eval_policy/__init__.py "$EVAL_POLICY/__init__.py"
+cp scripts/eval_policy/moe_smolvla_policy.py "$EVAL_POLICY/moe_smolvla_policy.py"
+
+cd ../..
 ```
 
 ### Download Checkpoints
@@ -53,58 +65,34 @@ outputs/moe_train/
   smolvla_moe_expert_top_long_no_st_proj/checkpoints/015000/pretrained_model/
   smolvla_moe_expert_pant_long_no_st_proj/checkpoints/019000/pretrained_model/
   smolvla_moe_expert_top_short_no_st_proj/checkpoints/020000/pretrained_model/
+  router/checkpoints/best/router.pt
 ```
 
 ### Run Evaluation
 
-Evaluate each garment category separately:
+The MoE policy automatically routes each garment to the correct expert model. Simply run with `--policy_type moe_smolvla`:
 
 ```bash
-# pant_short (90.00%)
+# Evaluate all garment types
+for garment in pant_short top_long pant_long top_short; do
+    python -m scripts.eval \
+        --policy_type moe_smolvla \
+        --garment_type "$garment" \
+        --num_episodes 5 \
+        --max_steps 600 \
+        --enable_cameras \
+        --device cpu \
+        --headless \
+        --task_description "fold the garment on the table"
+done
+```
+
+Or evaluate a single garment type:
+
+```bash
 python -m scripts.eval \
-    --policy_type lerobot \
-    --policy_path outputs/moe_train/smolvla_moe_expert_pant_short_no_st_proj/checkpoints/011000/pretrained_model \
-    --dataset_root Datasets/example/pant_short_merged \
+    --policy_type moe_smolvla \
     --garment_type "pant_short" \
-    --num_episodes 5 \
-    --max_steps 600 \
-    --enable_cameras \
-    --device cpu \
-    --headless \
-    --task_description "fold the garment on the table"
-
-# top_long (78.33%)
-python -m scripts.eval \
-    --policy_type lerobot \
-    --policy_path outputs/moe_train/smolvla_moe_expert_top_long_no_st_proj/checkpoints/015000/pretrained_model \
-    --dataset_root Datasets/example/top_long_merged \
-    --garment_type "top_long" \
-    --num_episodes 5 \
-    --max_steps 600 \
-    --enable_cameras \
-    --device cpu \
-    --headless \
-    --task_description "fold the garment on the table"
-
-# pant_long (58.33%)
-python -m scripts.eval \
-    --policy_type lerobot \
-    --policy_path outputs/moe_train/smolvla_moe_expert_pant_long_no_st_proj/checkpoints/019000/pretrained_model \
-    --dataset_root Datasets/example/pant_long_merged \
-    --garment_type "pant_long" \
-    --num_episodes 5 \
-    --max_steps 600 \
-    --enable_cameras \
-    --device cpu \
-    --headless \
-    --task_description "fold the garment on the table"
-
-# top_short (51.67%)
-python -m scripts.eval \
-    --policy_type lerobot \
-    --policy_path outputs/moe_train/smolvla_moe_expert_top_short_no_st_proj/checkpoints/020000/pretrained_model \
-    --dataset_root Datasets/example/top_short_merged \
-    --garment_type "top_short" \
     --num_episodes 5 \
     --max_steps 600 \
     --enable_cameras \
@@ -118,17 +106,10 @@ Each command prints per-garment and overall success rates. With 5 episodes per g
 
 ## Source Code
 
-The `source_code/` directory contains modified lerobot SmolVLA files required to load our checkpoints. These must be copied into the lerobot package before evaluation:
-
-```bash
-# After installing lehome-challenge, copy modified files:
-LEROBOT_SMOLVLA=$(python -c "import lerobot.policies.smolvla; import os; print(os.path.dirname(lerobot.policies.smolvla.__file__))")
-cp source_code/lerobot_policies_smolvla/* "$LEROBOT_SMOLVLA/"
-```
-
-See `source_code/README.md` for details.
+See `source_code/README.md` for details on the modified lerobot files and MoE policy implementation.
 
 ## Notes
 - Device must be `cpu` to avoid garment physics issues
-- Each garment type uses a separate specialist model
+- The MoE policy uses a trained router to classify garment type and routes to the appropriate specialist model
+- Sticky routing: the expert is selected on the first frame and locked for the entire episode
 - Evaluation uses fixed seed by default (use `--use_random_seed` for random initialization)
