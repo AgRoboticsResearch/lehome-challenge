@@ -45,16 +45,15 @@ hf download lehome/asset_challenge --repo-type dataset --local-dir Assets
 hf download lehome/dataset_challenge_merged --repo-type dataset --local-dir Datasets/example
 
 # Install submission source code
-cd submission/source_code
-
 LEROBOT_SMOLVLA=$(python -c "import lerobot.policies.smolvla; import os; print(os.path.dirname(lerobot.policies.smolvla.__file__))")
-cp lerobot_policies_smolvla/* "$LEROBOT_SMOLVLA/"
+cp submission/source_code/lerobot_policies_smolvla/* "$LEROBOT_SMOLVLA/"
 
-EVAL_POLICY="../../scripts/eval_policy"
-cp scripts/eval_policy/__init__.py "$EVAL_POLICY/__init__.py"
-cp scripts/eval_policy/moe_smolvla_policy.py "$EVAL_POLICY/moe_smolvla_policy.py"
+cp submission/source_code/scripts/eval_policy/__init__.py scripts/eval_policy/__init__.py
+cp submission/source_code/scripts/eval_policy/moe_smolvla_policy.py scripts/eval_policy/moe_smolvla_policy.py
 
-cd ../..
+# Verify installation
+python -c "from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel; print('lerobot OK')"
+python -c "from scripts.eval_policy import MoESmolVLAPolicy; print('eval_policy OK')"
 ```
 
 ### Download Checkpoints
