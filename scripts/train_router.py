@@ -207,6 +207,7 @@ def prepare_router_dataset(
     dataset_root: Path,
     extractor: VLMFeatureExtractor,
     episode_stride: int = 4,
+    frame_stride: int = 1,
     cache_dir: Path | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """准备 Router 训练数据集
@@ -215,6 +216,7 @@ def prepare_router_dataset(
         dataset_root: Dataset root path
         extractor: VLM feature extractor
         episode_stride: Stride for sampling episodes (default: 4, 每4个取1个)
+        frame_stride: Stride for sampling frames within each episode (default: 1, all frames)
         cache_dir: Cache directory for extracted features
 
     Returns:
@@ -232,27 +234,30 @@ def prepare_router_dataset(
     test_episodes = list(range(0, 1000, episode_stride))
     print(f"[Dataset] Sampling {len(test_episodes)} episodes (stride={episode_stride})")
 
-    # Find first frames
+    # Collect all frames from sampled episodes (with frame_stride)
     ep_indices = np.array([x.item() for x in dataset.hf_dataset["episode_index"]])
 
-    first_frame_indices = []
+    all_frame_indices = []
     labels = []
 
-    print("[Dataset] Finding first frames...")
+    print(f"[Dataset] Collecting frames (frame_stride={frame_stride})...")
     for ep_idx in tqdm(test_episodes):
         matches = np.where(ep_indices == ep_idx)[0]
         if len(matches) > 0:
-            first_frame_indices.append(matches[0])
+            # Use ALL frames (or stride through them)
+            frame_indices = matches[::frame_stride]
             _, label = get_garment_type(ep_idx)
-            labels.append(label)
+            for fi in frame_indices:
+                all_frame_indices.append(fi)
+                labels.append(label)
 
-    print(f"[Dataset] Found {len(first_frame_indices)} first frames")
+    print(f"[Dataset] Collected {len(all_frame_indices)} frames from {len(test_episodes)} episodes")
     label_counts = np.bincount(labels)
     print(f"[Dataset] Label distribution: {dict(zip(TYPE_NAMES, label_counts))}")
 
     # Check cache
     if cache_dir is not None:
-        cache_file = cache_dir / "router_features.pt"
+        cache_file = cache_dir / f"router_features_fs{frame_stride}.pt"
         if cache_file.exists():
             print(f"[Dataset] Loading cached features from {cache_file}")
             cached = torch.load(cache_file)
@@ -263,7 +268,7 @@ def prepare_router_dataset(
     print(f"[Dataset] Extracting features from {cam_key}...")
 
     all_features = []
-    for i, frame_idx in enumerate(tqdm(first_frame_indices, desc="Extracting features")):
+    for i, frame_idx in enumerate(tqdm(all_frame_indices, desc="Extracting features")):
         frame = dataset[frame_idx]
         image = frame.get(cam_key)
 
@@ -510,10 +515,12 @@ def parse_args():
                         help="Device to use (cuda or cpu)")
     parser.add_argument("--episode_stride", type=int, default=4,
                         help="Stride for sampling episodes (default: 4, 每4个取1个)")
+    parser.add_argument("--frame_stride", type=int, default=1,
+                        help="Stride for sampling frames within episodes (default: 1, all frames)")
     parser.add_argument("--epochs", type=int, default=200,
                         help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=32,
-                        help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=128,
+                        help="Batch size (default: 128 for larger datasets)")
     parser.add_argument("--lr", type=float, default=5e-4,
                         help="Learning rate")
     parser.add_argument("--val_split", type=float, default=0.2,
@@ -549,6 +556,7 @@ def main():
             dataset_root=Path(args.dataset_root),
             extractor=extractor,
             episode_stride=args.episode_stride,
+            frame_stride=args.frame_stride,
             cache_dir=cache_dir,
         )
 
@@ -596,6 +604,7 @@ def main():
             dataset_root=Path(args.dataset_root),
             extractor=extractor,
             episode_stride=args.episode_stride,
+            frame_stride=args.frame_stride,
             cache_dir=cache_dir,
         )
 
