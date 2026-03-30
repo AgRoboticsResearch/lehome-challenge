@@ -492,6 +492,12 @@ def setup_eval_parser() -> argparse.ArgumentParser:
         default="Datasets/eval",
         help="Path to save evaluation datasets.",
     )
+    parser.add_argument(
+        "--num_datasets",
+        type=int,
+        default=1,
+        help="Number of evaluation datasets to record per garment. Each dataset gets its own folder.",
+    )
 
     # Policy arguments for Imitation Learning (IL)
     # Note: Available policy types are dynamically loaded from PolicyRegistry

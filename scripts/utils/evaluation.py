@@ -144,10 +144,18 @@ def run_evaluation_loop(
         root_path = Path(args.eval_dataset_path)
         save_mode = args.save_mode
 
+        # Extract garment category prefix from actual garment_name
+        # e.g., "Pant_Long_Unseen_0" -> "pant_long" (timestamp added by get_next_experiment_path_with_gap)
+        if garment_name:
+            parts = garment_name.split("_")
+            garment_prefix = f"{parts[0].lower()}_{parts[1].lower()}" if len(parts) >= 2 else parts[0].lower()
+        else:
+            garment_prefix = args.garment_type
+
         if save_mode == "both":
             # Create two separate datasets for success and failure
-            success_path = get_next_experiment_path_with_gap(root_path / "success", name_prefix=args.garment_type)
-            failure_path = get_next_experiment_path_with_gap(root_path / "failure", name_prefix=args.garment_type)
+            success_path = get_next_experiment_path_with_gap(root_path / "success", name_prefix=garment_prefix)
+            failure_path = get_next_experiment_path_with_gap(root_path / "failure", name_prefix=garment_prefix)
 
             eval_dataset_success = LeRobotDataset.create(
                 repo_id="lehome_eval_success",
@@ -174,7 +182,7 @@ def run_evaluation_loop(
             eval_dataset = LeRobotDataset.create(
                 repo_id="lehome_eval",
                 fps=fps,
-                root=get_next_experiment_path_with_gap(root_path, name_prefix=args.garment_type),
+                root=get_next_experiment_path_with_gap(root_path, name_prefix=garment_prefix),
                 use_videos=True,
                 image_writer_threads=8,
                 image_writer_processes=0,
@@ -839,44 +847,53 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
         else:
             logger.info(f"HIL/Policy sync enabled but teleop_device is '{args.teleop_device}' (not a leader arm)")
 
+    num_datasets = getattr(args, "num_datasets", 1)
+
     try:
-        for garment_idx, (garment_name, garment_stage) in enumerate(eval_list):
-            logger.info(
-                f"Evaluating: {garment_name} ({garment_stage}) ({garment_idx+1}/{len(eval_list)})"
-            )
+        for dataset_idx in range(num_datasets):
+            if num_datasets > 1:
+                logger.info(f"=== DATASET {dataset_idx + 1}/{num_datasets} ===")
 
-            # Switch Garment Logic
-            if garment_idx > 0:
-                if hasattr(env, "switch_garment"):
-                    env.switch_garment(garment_name, garment_stage)
-                    env.reset()
-                    policy.reset()
-                else:
-                    env.close()
-                    env_cfg.garment_name = garment_name
-                    env_cfg.garment_version = garment_stage
-                    env = gym.make(args.task, cfg=env_cfg).unwrapped
-                    env.initialize_obs()
-                    policy.reset()
+            for garment_idx, (garment_name, garment_stage) in enumerate(eval_list):
+                logger.info(
+                    f"Evaluating: {garment_name} ({garment_stage}) ({garment_idx+1}/{len(eval_list)})"
+                )
 
-            # Run Loop
-            metrics, quit_requested = run_evaluation_loop(
-                env=env,
-                policy=policy,
-                args=args,
-                ee_solver=ee_solver,
-                is_bimanual=is_bimanual,
-                garment_name=garment_name,
-                leader_device=leader_device,
-            )
+                # Switch Garment Logic
+                if garment_idx > 0 or dataset_idx > 0:
+                    if hasattr(env, "switch_garment"):
+                        env.switch_garment(garment_name, garment_stage)
+                        env.reset()
+                        policy.reset()
+                    else:
+                        env.close()
+                        env_cfg.garment_name = garment_name
+                        env_cfg.garment_version = garment_stage
+                        env = gym.make(args.task, cfg=env_cfg).unwrapped
+                        env.initialize_obs()
+                        policy.reset()
 
-            all_garment_metrics.append(
-                {"garment_name": garment_name, "metrics": metrics}
-            )
+                # Run Loop
+                metrics, quit_requested = run_evaluation_loop(
+                    env=env,
+                    policy=policy,
+                    args=args,
+                    ee_solver=ee_solver,
+                    is_bimanual=is_bimanual,
+                    garment_name=garment_name,
+                    leader_device=leader_device,
+                )
 
-            # Stop evaluation if user requested quit (HIL mode)
+                all_garment_metrics.append(
+                    {"garment_name": garment_name, "metrics": metrics}
+                )
+
+                # Stop evaluation if user requested quit (HIL mode)
+                if quit_requested:
+                    logger.info("[HIL] Quit requested by user. Stopping evaluation...")
+                    break
+
             if quit_requested:
-                logger.info("[HIL] Quit requested by user. Stopping evaluation...")
                 break
 
     finally:
