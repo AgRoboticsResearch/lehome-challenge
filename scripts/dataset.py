@@ -14,7 +14,6 @@ from pathlib import Path
 
 from .utils import (
     dataset_inspection,
-    dataset_processing,
     setup_inspect_parser,
     setup_read_parser,
     setup_augment_parser,
@@ -56,6 +55,8 @@ def main():
             show_stats=args.show_stats,
         )
     elif args.command == "augment":
+        from .utils import dataset_processing
+
         dataset_processing.augment_ee_pose(
             Path(args.dataset_root).resolve(),
             Path(args.urdf_path).resolve(),
@@ -64,6 +65,7 @@ def main():
             overwrite=args.overwrite,
         )
     elif args.command == "merge":
+        from .utils import dataset_processing
         import ast
 
         source_roots = [Path(p) for p in ast.literal_eval(args.source_roots)]
