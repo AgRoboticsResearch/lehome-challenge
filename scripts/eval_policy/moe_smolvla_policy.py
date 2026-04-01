@@ -17,6 +17,7 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
 # Import to register smolvla_new_line_processor in ProcessorStepRegistry
 # This is required for loading expert preprocessors with normalization stats
 from lerobot.policies.smolvla.processor_smolvla import SmolVLANewLineProcessor  # noqa: F401
@@ -73,7 +74,9 @@ class MoESmolVLAPolicy(BasePolicy):
         super().__init__()
 
         # Default policy_path from eval framework (should be ignored for MoE)
-        DEFAULT_POLICY_PATH = "outputs/train/diffusion_fold_1/checkpoints/100000/pretrained_model"
+        DEFAULT_POLICY_PATH = (
+            "outputs/train/diffusion_fold_1/checkpoints/100000/pretrained_model"
+        )
 
         # Normalize empty strings to None
         if model_path == "":
@@ -152,6 +155,13 @@ class MoESmolVLAPolicy(BasePolicy):
             vlm_model_path, meta
         )
 
+        original_n_action_steps = self.base_policy.config.n_action_steps
+        self.base_policy.config.n_action_steps = 12
+        self.base_policy.reset()
+        logger.info(
+            f"Overridden n_action_steps: {original_n_action_steps} → 12 (re-plan every 12 steps / 100ms)"
+        )
+
         # Extract shared VLM model
         self.vlm_with_expert = self.base_policy.model.vlm_with_expert
 
@@ -192,10 +202,14 @@ class MoESmolVLAPolicy(BasePolicy):
         """Get default expert checkpoint paths from moe_train directory."""
         base_path = Path("outputs/moe_train")
         return {
-            "pant_short": base_path / "smolvla_moe_expert_pant_short_no_st_proj/checkpoints/010000/pretrained_model",
-            "pant_long": base_path / "smolvla_moe_expert_pant_long_no_st_proj/checkpoints/009000/pretrained_model",
-            "top_short": base_path / "smolvla_moe_expert_top_short_no_st_proj/checkpoints/014000/pretrained_model",
-            "top_long": base_path / "smolvla_moe_expert_top_long_no_st_proj/checkpoints/011000/pretrained_model",
+            "pant_short": base_path
+            / "smolvla_moe_expert_pant_short_no_st_proj/checkpoints/010000/pretrained_model",
+            "pant_long": base_path
+            / "smolvla_moe_expert_pant_long_no_st_proj/checkpoints/009000/pretrained_model",
+            "top_short": base_path
+            / "smolvla_moe_expert_top_short_no_st_proj/checkpoints/014000/pretrained_model",
+            "top_long": base_path
+            / "smolvla_moe_expert_top_long_no_st_proj/checkpoints/011000/pretrained_model",
         }
 
     def _log_expert_status(self):
@@ -216,14 +230,14 @@ class MoESmolVLAPolicy(BasePolicy):
         if self.missing_experts:
             logger.warning("-" * 60)
             logger.warning("⚠️ Some experts are missing!")
-            logger.warning("Smart fallback will be used when Router predicts missing types.")
+            logger.warning(
+                "Smart fallback will be used when Router predicts missing types."
+            )
             logger.warning(f"Missing: {self.missing_experts}")
         logger.info("=" * 60)
 
     def _load_base_policy_with_preprocessor(
-        self,
-        vlm_model_path: str,
-        meta: Optional[LeRobotDatasetMetadata]
+        self, vlm_model_path: str, meta: Optional[LeRobotDatasetMetadata]
     ) -> SmolVLAPolicy:
         """Load base policy with preprocessor and postprocessor initialized.
 
@@ -264,7 +278,9 @@ class MoESmolVLAPolicy(BasePolicy):
 
         return policy
 
-    def _load_expert_checkpoint(self, checkpoint_path: str, garment_type: str) -> Dict[str, nn.Module]:
+    def _load_expert_checkpoint(
+        self, checkpoint_path: str, garment_type: str
+    ) -> Dict[str, nn.Module]:
         """Load expert-specific components (lm_expert, action projections, action_time_mlp).
 
         Following MoE design: each expert has independent:
@@ -291,11 +307,11 @@ class MoESmolVLAPolicy(BasePolicy):
         # Note: action_time_mlp_in/out are always trainable (no config flag to freeze them)
         # so each expert checkpoint contains different weights for them
         expert_components = {
-            'lm_expert': copy.deepcopy(full_policy.model.vlm_with_expert.lm_expert),
-            'action_in_proj': copy.deepcopy(full_policy.model.action_in_proj),
-            'action_out_proj': copy.deepcopy(full_policy.model.action_out_proj),
-            'action_time_mlp_in': copy.deepcopy(full_policy.model.action_time_mlp_in),
-            'action_time_mlp_out': copy.deepcopy(full_policy.model.action_time_mlp_out),
+            "lm_expert": copy.deepcopy(full_policy.model.vlm_with_expert.lm_expert),
+            "action_in_proj": copy.deepcopy(full_policy.model.action_in_proj),
+            "action_out_proj": copy.deepcopy(full_policy.model.action_out_proj),
+            "action_time_mlp_in": copy.deepcopy(full_policy.model.action_time_mlp_in),
+            "action_time_mlp_out": copy.deepcopy(full_policy.model.action_time_mlp_out),
         }
 
         # Move to device and freeze
@@ -305,8 +321,12 @@ class MoESmolVLAPolicy(BasePolicy):
                 param.requires_grad = False
 
         # Load expert-specific preprocessor and postprocessor (for normalization stats)
-        expert_components['preprocessor'] = self._load_expert_preprocessor(checkpoint_path)
-        expert_components['postprocessor'] = self._load_expert_postprocessor(checkpoint_path)
+        expert_components["preprocessor"] = self._load_expert_preprocessor(
+            checkpoint_path
+        )
+        expert_components["postprocessor"] = self._load_expert_postprocessor(
+            checkpoint_path
+        )
 
         logger.info(f"✅ Loaded expert components for {garment_type}")
 
@@ -315,6 +335,7 @@ class MoESmolVLAPolicy(BasePolicy):
     def _load_expert_preprocessor(self, checkpoint_path: Path):
         """Load preprocessor with expert-specific normalization stats."""
         from lerobot.processor import PolicyProcessorPipeline
+
         try:
             preprocessor = PolicyProcessorPipeline.from_pretrained(
                 pretrained_model_name_or_path=str(checkpoint_path),
@@ -324,13 +345,19 @@ class MoESmolVLAPolicy(BasePolicy):
             logger.info(f"  ✅ Loaded preprocessor for {checkpoint_path.name}")
             return preprocessor
         except Exception as e:
-            logger.warning(f"  ⚠️ Failed to load preprocessor: {e}, using base policy's preprocessor")
+            logger.warning(
+                f"  ⚠️ Failed to load preprocessor: {e}, using base policy's preprocessor"
+            )
             return None
 
     def _load_expert_postprocessor(self, checkpoint_path: Path):
         """Load postprocessor with expert-specific denormalization stats."""
         from lerobot.processor import PolicyProcessorPipeline
-        from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+        from lerobot.processor.converters import (
+            policy_action_to_transition,
+            transition_to_policy_action,
+        )
+
         try:
             postprocessor = PolicyProcessorPipeline.from_pretrained(
                 pretrained_model_name_or_path=str(checkpoint_path),
@@ -342,7 +369,9 @@ class MoESmolVLAPolicy(BasePolicy):
             logger.info(f"  ✅ Loaded postprocessor for {checkpoint_path.name}")
             return postprocessor
         except Exception as e:
-            logger.warning(f"  ⚠️ Failed to load postprocessor: {e}, using base policy's postprocessor")
+            logger.warning(
+                f"  ⚠️ Failed to load postprocessor: {e}, using base policy's postprocessor"
+            )
             return None
 
     def _load_router(self, checkpoint_path: str) -> nn.Module:
@@ -370,7 +399,9 @@ class MoESmolVLAPolicy(BasePolicy):
 
         router.eval()
 
-        logger.info(f"Router loaded with {config['num_classes']} classes: {config['type_names']}")
+        logger.info(
+            f"Router loaded with {config['num_classes']} classes: {config['type_names']}"
+        )
         logger.info(f"Router dtype: {vlm_dtype}")
 
         return router
@@ -381,6 +412,7 @@ class MoESmolVLAPolicy(BasePolicy):
         self.selected_expert = None
         self._locked_expert = None  # Sticky Routing: 清除锁定状态
         self.route_confidence_history = []
+        self.base_policy.reset()
 
     def select_action(self, observation: Dict[str, np.ndarray]) -> np.ndarray:
         """
@@ -412,12 +444,16 @@ class MoESmolVLAPolicy(BasePolicy):
             self._locked_expert = garment_type
             self.selected_expert = garment_type
 
-            logger.info(f"🔒 Sticky Routing: Locked Expert {garment_type} (confidence: {confidence:.3f})")
+            logger.info(
+                f"🔒 Sticky Routing: Locked Expert {garment_type} (confidence: {confidence:.3f})"
+            )
 
         # === 使用锁定的Expert（不再调用Router）===
         return self._select_action_with_expert(observation_dict, self._locked_expert)
 
-    def _prepare_observation(self, observation: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    def _prepare_observation(
+        self, observation: Dict[str, np.ndarray]
+    ) -> Dict[str, np.ndarray]:
         """Prepare observation for model input (keep as numpy arrays)."""
         obs_dict = {}
 
@@ -487,7 +523,9 @@ class MoESmolVLAPolicy(BasePolicy):
 
             # === Smart Fallback for Missing Experts ===
             if garment_type in self.missing_experts:
-                logger.warning(f"⚠️ Router predicted '{garment_type}' but expert not available")
+                logger.warning(
+                    f"⚠️ Router predicted '{garment_type}' but expert not available"
+                )
 
                 # Find the best available expert based on router probabilities
                 best_available_type = None
@@ -501,8 +539,10 @@ class MoESmolVLAPolicy(BasePolicy):
                             best_available_type = gtype
 
                 if best_available_type is not None:
-                    logger.warning(f"🔄 Smart fallback: '{garment_type}' → '{best_available_type}' "
-                                f"(confidence: {best_available_prob:.3f})")
+                    logger.warning(
+                        f"🔄 Smart fallback: '{garment_type}' → '{best_available_type}' "
+                        f"(confidence: {best_available_prob:.3f})"
+                    )
                     garment_type = best_available_type
                     confidence = best_available_prob
                 else:
@@ -511,9 +551,7 @@ class MoESmolVLAPolicy(BasePolicy):
             return garment_type, confidence
 
     def _select_action_with_expert(
-        self,
-        observation_dict: Dict[str, np.ndarray],
-        garment_type: str
+        self, observation_dict: Dict[str, np.ndarray], garment_type: str
     ) -> np.ndarray:
         """Select action using the specified expert.
 
@@ -533,22 +571,30 @@ class MoESmolVLAPolicy(BasePolicy):
         original_action_time_mlp_out = self.base_policy.model.action_time_mlp_out
 
         # Temporarily swap in expert components
-        self.base_policy.model.vlm_with_expert.lm_expert = expert_components['lm_expert']
-        self.base_policy.model.action_in_proj = expert_components['action_in_proj']
-        self.base_policy.model.action_out_proj = expert_components['action_out_proj']
-        self.base_policy.model.action_time_mlp_in = expert_components['action_time_mlp_in']
-        self.base_policy.model.action_time_mlp_out = expert_components['action_time_mlp_out']
+        self.base_policy.model.vlm_with_expert.lm_expert = expert_components[
+            "lm_expert"
+        ]
+        self.base_policy.model.action_in_proj = expert_components["action_in_proj"]
+        self.base_policy.model.action_out_proj = expert_components["action_out_proj"]
+        self.base_policy.model.action_time_mlp_in = expert_components[
+            "action_time_mlp_in"
+        ]
+        self.base_policy.model.action_time_mlp_out = expert_components[
+            "action_time_mlp_out"
+        ]
 
         # CRITICAL: Each expert was trained with different dataset stats.
         # We MUST use the expert's preprocessor/postprocessor for correct normalization.
         # Falling back to base_policy's preprocessor would use WRONG stats!
-        expert_preprocessor = expert_components.get('preprocessor')
-        expert_postprocessor = expert_components.get('postprocessor')
+        expert_preprocessor = expert_components.get("preprocessor")
+        expert_postprocessor = expert_components.get("postprocessor")
 
         # Validate that expert has preprocessor - without it, normalization will be wrong!
         if expert_preprocessor is None:
             logger.error(f"❌ CRITICAL: Expert {garment_type} has NO preprocessor!")
-            logger.error(f"   Cannot normalize observation correctly - this will cause wrong actions!")
+            logger.error(
+                f"   Cannot normalize observation correctly - this will cause wrong actions!"
+            )
             raise ValueError(
                 f"Expert {garment_type} missing preprocessor. "
                 f"Each expert must have its own preprocessor with correct normalization stats. "
@@ -557,14 +603,18 @@ class MoESmolVLAPolicy(BasePolicy):
 
         if expert_postprocessor is None:
             logger.error(f"❌ CRITICAL: Expert {garment_type} has NO postprocessor!")
-            logger.error(f"   Cannot denormalize action correctly - this will cause wrong actions!")
+            logger.error(
+                f"   Cannot denormalize action correctly - this will cause wrong actions!"
+            )
             raise ValueError(
                 f"Expert {garment_type} missing postprocessor. "
                 f"Each expert must have its own postprocessor with correct denormalization stats. "
                 f"Check if 'policy_postprocessor.json' exists in the expert checkpoint."
             )
 
-        logger.info(f"✅ [{garment_type}] Using expert preprocessor/postprocessor with correct normalization stats")
+        logger.info(
+            f"✅ [{garment_type}] Using expert preprocessor/postprocessor with correct normalization stats"
+        )
 
         try:
             with torch.no_grad():
@@ -592,9 +642,7 @@ class MoESmolVLAPolicy(BasePolicy):
         return action
 
     def _prepare_batch_with_preprocessor(
-        self,
-        obs_dict: Dict[str, np.ndarray],
-        preprocessor
+        self, obs_dict: Dict[str, np.ndarray], preprocessor
     ) -> Dict[str, torch.Tensor]:
         """Prepare observation using a specific preprocessor (handles language tokens)."""
         from lerobot.processor.core import TransitionKey
@@ -616,9 +664,9 @@ class MoESmolVLAPolicy(BasePolicy):
         # Map camera keys: LeHome uses top_rgb/left_rgb/right_rgb,
         # but preprocessor expects camera1/camera2/camera3
         camera_key_mapping = {
-            'observation.images.top_rgb': 'observation.images.camera1',
-            'observation.images.left_rgb': 'observation.images.camera2',
-            'observation.images.right_rgb': 'observation.images.camera3',
+            "observation.images.top_rgb": "observation.images.camera1",
+            "observation.images.left_rgb": "observation.images.camera2",
+            "observation.images.right_rgb": "observation.images.camera3",
         }
 
         # Apply mapping if source keys exist
@@ -667,7 +715,9 @@ class MoESmolVLAPolicy(BasePolicy):
         }
         return transition
 
-    def _prepare_batch_for_base_policy(self, obs_dict: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+    def _prepare_batch_for_base_policy(
+        self, obs_dict: Dict[str, np.ndarray]
+    ) -> Dict[str, torch.Tensor]:
         """Prepare observation using base_policy's preprocessor (handles language tokens)."""
         from lerobot.processor.core import TransitionKey
 
@@ -688,9 +738,9 @@ class MoESmolVLAPolicy(BasePolicy):
         # Map camera keys: LeHome uses top_rgb/left_rgb/right_rgb,
         # but base_policy expects camera1/camera2/camera3
         camera_key_mapping = {
-            'observation.images.top_rgb': 'observation.images.camera1',
-            'observation.images.left_rgb': 'observation.images.camera2',
-            'observation.images.right_rgb': 'observation.images.camera3',
+            "observation.images.top_rgb": "observation.images.camera1",
+            "observation.images.left_rgb": "observation.images.camera2",
+            "observation.images.right_rgb": "observation.images.camera3",
         }
 
         # Apply mapping if source keys exist
@@ -708,7 +758,10 @@ class MoESmolVLAPolicy(BasePolicy):
         }
 
         # Use base_policy's preprocessor (handles language tokens)
-        if hasattr(self.base_policy, 'preprocessor') and self.base_policy.preprocessor is not None:
+        if (
+            hasattr(self.base_policy, "preprocessor")
+            and self.base_policy.preprocessor is not None
+        ):
             transformed = self.base_policy.preprocessor._forward(transition)
             batch_obs = self.base_policy.preprocessor.to_output(transformed)
         else:
