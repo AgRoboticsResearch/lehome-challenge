@@ -771,6 +771,7 @@ DISPLAY=:1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python -m scripts.eval \
       --enable_hil \
       --policy_sync_verbose \
       --max_steps 1200 \
+      --num_datasets 5 \
       --num_episodes 1 \
       --save_datasets \
       --eval_dataset_path Datasets/record \
@@ -780,3 +781,55 @@ DISPLAY=:1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python -m scripts.eval \
 exec su -l $USER
 
 python -m scripts.dataset inspect --dataset_root Datasets/record/pant_long_20260328_185934
+
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python scripts/train_router.py \
+    --dataset_root Datasets/example/four_types_merged \
+    --output_dir outputs/moe_train/router_all_frames
+
+##MOE_SMOLVLA
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
+    --policy_type moe_smolvla \
+    --garment_type "pant_short" \
+    --num_episodes 1 \
+    --max_steps 600 \
+    --enable_cameras \
+    --headless \
+    --device cpu
+
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
+    --policy_type moe_smolvla \
+    --garment_type "top_short" \
+    --num_episodes 5 \
+    --max_steps 600 \
+    --enable_cameras \
+    --headless \
+    --device cpu
+
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=1 python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/train/smolvla_moe_expert_pant_long_0329/checkpoints/010000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
+    --garment_type "pant_long" \
+    --num_episodes 5 \
+    --max_steps 600 \
+    --enable_cameras \
+    --device cpu \
+    --headless 
+
+
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python -m scripts.eval \
+    --policy_type lerobot \
+    --policy_path outputs/moe_train/smolvla_moe_expert_top_short_no_st_proj/checkpoints/014000/pretrained_model \
+    --dataset_root Datasets/example/four_types_merged \
+    --garment_type "top_short" \
+    --num_episodes 5 \
+    --max_steps 600 \
+    --enable_cameras \
+    --device cpu \
+    --headless 
+
+ TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 ./scripts/eval_checkpoints.sh \
+      --model smolvla_moe_expert_pant_long_0329 \
+      --dataset_root Datasets/example/pant_long_merged \
+      --garment_type pant_long \
+      --checkpoint_min 10000

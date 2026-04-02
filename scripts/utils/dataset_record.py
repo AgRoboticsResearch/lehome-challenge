@@ -54,9 +54,7 @@ def log_success_check_details(result: dict) -> None:
     details = result.get("details", {})
     for key, condition_info in details.items():
         status = "✓" if condition_info.get("passed", False) else "✗"
-        logger.info(
-            f"  {condition_info.get('description', '')} -> {status}"
-        )
+        logger.info(f"  {condition_info.get('description', '')} -> {status}")
 
     success = result.get("success", False)
     logger.info(
@@ -211,12 +209,14 @@ def register_teleop_callbacks(
 def create_dataset_if_needed(
     args: argparse.Namespace,
     dataset_index: int = 0,
+    actual_garment_name: Optional[str] = None,
 ) -> Tuple[Optional[LeRobotDataset], Optional[Path], Optional[Any], bool]:
     """Create LeRobotDataset if recording is enabled.
 
     Args:
         args: Command-line arguments containing recording configuration.
         dataset_index: Index of the current dataset (unused, kept for compatibility).
+        actual_garment_name: Actual garment name from env.cfg.garment_name (preferred over args).
 
     Returns:
         Tuple of (dataset, json_path, solver, is_bi_arm):
@@ -276,8 +276,8 @@ def create_dataset_if_needed(
                 "range_mm": [0, 65535],
                 "range_m": [0.0, 65.535],
                 "precision_mm": 1,
-                "conversion": "depth_meters = uint16_value / 1000.0"
-            }
+                "conversion": "depth_meters = uint16_value / 1000.0",
+            },
         }
 
     if is_bi_arm:
@@ -331,8 +331,9 @@ def create_dataset_if_needed(
     root_path = Path(getattr(args, "dataset_root", "Datasets/record"))
 
     # Extract garment type prefix from garment_name for folder naming
-    # e.g., "Top_Long_Unseen_0" -> "top_long_20240328_143022"
-    garment_name = getattr(args, "garment_name", None)
+    # e.g., "Top_Long_Unseen_0" -> "top_long" (timestamp added by get_next_experiment_path_with_gap)
+    # Prefer actual_garment_name (from env.cfg) over args.garment_name to avoid mismatches
+    garment_name = actual_garment_name or getattr(args, "garment_name", None)
     if garment_name:
         parts = garment_name.split("_")
         if len(parts) >= 2:
@@ -344,15 +345,10 @@ def create_dataset_if_needed(
     else:
         garment_prefix = "dataset"
 
-    # Create name with datetime: top_long_20240328_143022
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name_prefix = f"{garment_prefix}_{timestamp}"
-
     dataset = LeRobotDataset.create(
         repo_id="abc",
         fps=30,
-        root=get_next_experiment_path_with_gap(root_path, name_prefix=name_prefix),
+        root=get_next_experiment_path_with_gap(root_path, name_prefix=garment_prefix),
         use_videos=True,
         image_writer_threads=8,
         image_writer_processes=0,
@@ -533,7 +529,9 @@ def run_recording_phase(
             if success.item() and not success_detected:
                 success_detected = True
                 logger.info("✅ [Recording] SUCCESS detected by environment!")
-                logger.info("   Press 'N' to confirm and save, or continue recording...")
+                logger.info(
+                    "   Press 'N' to confirm and save, or continue recording..."
+                )
 
             observations = env._get_observations()
             if (
@@ -547,7 +545,9 @@ def run_recording_phase(
                 # pointcloud = env._get_workspace_pointcloud(
                 #     num_points=4096, use_fps=True
                 # )
-                print("Converting pointcloud online is time-consuming, please convert offline")
+                print(
+                    "Converting pointcloud online is time-consuming, please convert offline"
+                )
             _, truncated = env._get_dones()
             frame = {**observations, "task": args.task_description}
 
@@ -614,9 +614,13 @@ def run_recording_phase(
 
         # Episode ended - show success status
         if success_detected:
-            logger.info(f"[Recording] Episode {episode_index} ended with SUCCESS (env detected)")
+            logger.info(
+                f"[Recording] Episode {episode_index} ended with SUCCESS (env detected)"
+            )
         else:
-            logger.info(f"[Recording] Episode {episode_index} ended (no env success detected)")
+            logger.info(
+                f"[Recording] Episode {episode_index} ended (no env success detected)"
+            )
 
         save_start_time = time.time()
         logger.info(f"[Recording] Saving episode {episode_index}...")
@@ -759,6 +763,16 @@ def record_dataset(args: argparse.Namespace, simulation_app: SimulationApp) -> N
     )
     teleop_interface.reset()
 
+    # Validate garment name: warn if args.garment_name differs from env.cfg.garment_name
+    actual_garment_name = env.cfg.garment_name
+    args_garment_name = getattr(args, "garment_name", None)
+    if args_garment_name and args_garment_name != actual_garment_name:
+        logger.warning(
+            f"Garment name mismatch: --garment_name={args_garment_name}, "
+            f"env.cfg.garment_name={actual_garment_name}. "
+            f"Using env value for dataset naming."
+        )
+
     count_render = 0
     printed_instructions = False
     idle_frame_counter = 0
@@ -799,8 +813,12 @@ def record_dataset(args: argparse.Namespace, simulation_app: SimulationApp) -> N
                         logger.info("=" * 60)
 
                         # Create new dataset for this iteration
-                        dataset, json_path, ee_solver, is_bi_arm = create_dataset_if_needed(
-                            args, dataset_index=dataset_index
+                        dataset, json_path, ee_solver, is_bi_arm = (
+                            create_dataset_if_needed(
+                                args,
+                                dataset_index=dataset_index,
+                                actual_garment_name=actual_garment_name,
+                            )
                         )
 
                         if dataset is None:
@@ -843,7 +861,9 @@ def record_dataset(args: argparse.Namespace, simulation_app: SimulationApp) -> N
                             flags["success"] = False
                             flags["remove"] = False
 
-                            logger.info(f"Ready for dataset {dataset_index + 2}/{num_datasets}")
+                            logger.info(
+                                f"Ready for dataset {dataset_index + 2}/{num_datasets}"
+                            )
                             logger.info("Press 'S' to start recording next dataset...")
 
                             # Wait for user to press S again for next dataset
