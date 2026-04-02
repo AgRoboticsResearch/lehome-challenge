@@ -59,21 +59,44 @@ def train(cfg: dict):
         print("Run with --precompute first.")
         return
 
-    print(f"Loading prefix cache from {prefix_cache_path} ...")
-    cache = torch.load(prefix_cache_path, map_location="cpu", weights_only=True)
-    print(f"  Loaded {len(cache)} frames")
+    # Memory-mapped tensor format: avoids loading ~30GB dict into RAM
+    mmap_path = prefix_cache_path.with_suffix(".mmap.pt")
 
-    sample = cache[0]
-    total_tokens = sample.shape[0]
-    d_model = sample.shape[1]
-    print(f"  Sample shape: {sample.shape}  (total_tokens={total_tokens}, d_model={d_model})")
+    if mmap_path.exists():
+        cache_tensor = torch.load(mmap_path, map_location="cpu", mmap=True, weights_only=True)
+        num_frames, total_tokens, d_model = cache_tensor.shape
+        print(f"Loaded {num_frames} frames from {mmap_path} (memory-mapped)")
+        print(f"  Shape: [{num_frames}, {total_tokens}, {d_model}]")
+    else:
+        # One-time conversion: dict -> stacked tensor
+        print(f"Loading prefix cache from {prefix_cache_path} ...")
+        cache = torch.load(prefix_cache_path, map_location="cpu", weights_only=True)
+        print(f"  Loaded {len(cache)} frames")
+
+        sample = cache[0]
+        total_tokens = sample.shape[0]
+        d_model = sample.shape[1]
+        print(f"  Sample shape: {sample.shape}  (total_tokens={total_tokens}, d_model={d_model})")
+
+        print("  Converting to memory-mapped tensor format ...")
+        indices = sorted(cache.keys())
+        stacked = torch.empty(len(indices), total_tokens, d_model, dtype=sample.dtype)
+        for i, idx in enumerate(indices):
+            stacked[i] = cache.pop(idx)  # free dict memory progressively
+        del cache
+
+        torch.save(stacked, mmap_path)
+        print(f"  Saved tensor cache to {mmap_path}")
+
+        cache_tensor = torch.load(mmap_path, map_location="cpu", mmap=True, weights_only=True)
+        del stacked
 
     num_img_tokens = cfg.get("num_image_tokens", 192)
     num_lang_tokens = cfg.get("num_lang_tokens", 3)
     num_state_tokens = total_tokens - num_img_tokens - num_lang_tokens
     print(f"  Token layout: {num_img_tokens} image + {num_lang_tokens} lang + {num_state_tokens} state = {total_tokens}")
 
-    dataset = PrefixEmbeddingDataset(cache)
+    dataset = PrefixEmbeddingDataset(cache_tensor)
     dataloader = DataLoader(
         dataset,
         batch_size=cfg["batch_size"],

@@ -158,15 +158,20 @@ class VLAPrefixHook:
 
 
 class PrefixEmbeddingDataset(Dataset):
-    def __init__(self, cache: dict[int, torch.Tensor], indices: list[int] | None = None):
-        self.cache = cache
-        self.indices = indices if indices is not None else sorted(cache.keys())
+    def __init__(self, data: dict[int, torch.Tensor] | torch.Tensor, indices: list[int] | None = None):
+        self.data = data
+        if indices is not None:
+            self.indices = indices
+        elif isinstance(data, dict):
+            self.indices = sorted(data.keys())
+        else:
+            self.indices = list(range(data.shape[0]))
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        return self.cache[self.indices[idx]]
+        return self.data[self.indices[idx]]
 
     @staticmethod
     def collate_fn(batch: list[torch.Tensor]) -> torch.Tensor:
