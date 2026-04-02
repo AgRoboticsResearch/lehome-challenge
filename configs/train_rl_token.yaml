@@ -1,5 +1,5 @@
 dataset_root: Datasets/example/top_long_merged
-smolvla_pretrained_path: null
+smolvla_pretrained_path: outputs/moe_train/smolvla_moe_expert_top_long_no_st_proj/checkpoints/011000/pretrained_model
 output_dir: outputs/rl_token/stage1
 prefix_cache_path: outputs/rl_token/prefix_cache_top_long.pt
 task_description: "fold the garment"
@@ -19,5 +19,5 @@ d_model: 960
 
 save_freq: 1000
 log_freq: 100
-device: cpu
+device: cuda
 seed: 42

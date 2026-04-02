@@ -75,10 +75,9 @@ class VLAPrefixHook:
         if path.is_dir():
             from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
-            policy = SmolVLAPolicy(self.config)
-            policy.model = VLAFlowMatching(self.config)
-            policy.load(pretrained_path)
-            self.model.load_state_dict(policy.model.state_dict())
+            policy = SmolVLAPolicy.from_pretrained(str(path))
+            state_dict = policy.model.state_dict()
+            self.model.load_state_dict(state_dict, strict=False)
         elif path.suffix in (".pt", ".safetensors"):
             state_dict = torch.load(pretrained_path, map_location="cpu", weights_only=True)
             self.model.load_state_dict(state_dict, strict=False)
