@@ -42,8 +42,8 @@
 │  │ (Expert cross-attn  │  │ -> [e_rl | z_{1:M}]           │              │
 │  │  to VLM KV-cache)   │  │ -> 4-layer TransformerEncoder │              │
 │  │                     │  │ -> z_rl at e_rl position      │              │
-│  │ -> action_out_proj  │  │ -> Linear(960->256) projection │             │
-│  │ -> a_tilde_{1:50}   │  │ -> z_rl [B, 256]              │              │
+│  │ -> action_out_proj  │  │ (NO projection -- z_rl is 960D) │            │
+│  │ -> a_tilde_{1:50}   │  │ -> z_rl [B, 960]              │              │
 │  └──────────┬──────────┘  └──────────┬───────────────────┘               │
 │             │                          │                                   │
 │   Take first C=12 steps               │                                    │
@@ -51,9 +51,9 @@
 │             ▼                          ▼                                    │
 │  ┌──────────────────────────────────────────────────┐                      │
 │  │              RL Actor pi_theta                    │                      │
-│  │  x = [z_rl(256), s_p(24)] = 280D                 │                      │
-│  │  input = [x(280), a_tilde_flat(144)] = 424D      │                      │
-│  │  MLP: 424 -> 512 -> 512 -> 144 (C x action_dim)  │                      │
+│  │  x = [z_rl(960), s_p(24)] = 984D                  │                      │
+│  │  input = [x(984), a_tilde_flat(144)] = 1128D      │                      │
+│  │  MLP: 1128 -> 512 -> 512 -> 144 (C x action_dim)  │                      │
 │  │  Gaussian: mu_theta(x, a_tilde), fixed sigma      │                      │
 │  │  Ref action dropout: 50% during training           │                      │
 │  │  -> a_{1:12} [B, 12, 12]                          │                      │
@@ -61,9 +61,9 @@
 │                                                                             │
 │  ┌──────────────────────────────────────────────────┐                      │
 │  │          Twin Critic Q_psi                        │                      │
-│  │  input = [x(280), a_flat(144)] = 424D            │                      │
-│  │  Q1: 424 -> 512 -> 512 -> 1                       │                      │
-│  │  Q2: 424 -> 512 -> 512 -> 1                       │                      │
+│  │  input = [x(984), a_flat(144)] = 1128D            │                      │
+│  │  Q1: 1128 -> 512 -> 512 -> 1                       │                      │
+│  │  Q2: 1128 -> 512 -> 512 -> 1                       │                      │
 │  │  min(Q1, Q2) for Bellman backup (TD3 style)       │                      │
 │  └──────────────────────────────────────────────────┘                      │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -134,21 +134,40 @@ Actor input: a_tilde_{1:12}  -->  Actor output: a_{1:12}
 
 | Item | Decision |
 |------|----------|
-| Transition format | **Chunk-level** -- one transition per C=12 steps |
-| Execution within chunk | **Open-loop** -- z_rl and s_p fixed, execute a_{1:12} sequentially |
+| Transition format | **Stride-2 sub-sampled chunk transitions** (paper Section V) |
+| Transitions per chunk | ~C/stride = 12/2 = 6 transitions per chunk execution |
+| Execution within chunk | **Open-loop** -- z_rl and s_p fixed at chunk start, execute a_{1:12} sequentially |
 | Reward accumulation | **Discounted sum within chunk** per paper Eq.3 |
-| Rationale | Dense reward makes sub-sampling unnecessary; chunk-level Q-value matches paper Eq.3 |
+| Rationale | ~6x data efficiency gain over single chunk-level storage; dense reward means sub-sampling does not lose information |
 
-**Transition stored in replay buffer:**
+**Stride-2 sub-sampling explanation (paper Section V):**
+
+The paper stores overlapping transitions at stride=2 from intermediate observations:
+
+```
+Chunk execution: Actor outputs a_{0:12}, env executes 12 steps
+Observations collected: obs_0, obs_1, obs_2, ..., obs_12
+
+Transitions stored in replay buffer (stride=2):
+  t0: (obs_0, a[0:12],  rewards[0:12],  obs_12)
+  t2: (obs_2, a[2:12],  rewards[2:12],  obs_14*)  <- note: needs extended action
+  t4: (obs_4, a[4:12],  rewards[4:12],  obs_16*)
+
+Implementation approach:
+  - Primary transition (t0): full chunk, directly from Actor output
+  - Sub-sampled transitions (t2, t4, ...): use same action slice, recompute obs/reward
+```
+
+**Primary transition (every chunk):**
 
 ```python
 {
-    "z_rl": z_rl_t0,           # [256] frozen RL token
+    "z_rl": z_rl_t0,           # [960] frozen RL token
     "s_p": s_p_t0,             # [24] joint_pos + joint_vel
     "ref_action": a_tilde,     # [12, 12] VLA reference (first C steps)
     "action": a,               # [12, 12] Actor output
     "reward": sum(gamma^t * r_t),  # discounted chunk return
-    "next_z_rl": z_rl_t12,    # [256] next chunk's RL token
+    "next_z_rl": z_rl_t12,    # [960] next chunk's RL token
     "next_s_p": s_p_t12,      # [24] next chunk's proprioception
     "done": done_t12,          # terminal flag
 }
@@ -165,32 +184,45 @@ for episode in range(N_episodes):
         with torch.no_grad():
             a_tilde_full = vla_policy.predict_action_chunk(obs)  # [1, 50, 12]
             a_tilde = a_tilde_full[:, :C, :]                     # [1, 12, 12]
-            z_rl = rl_token_encoder(vlm_features)                 # [1, 256]
+            z_rl = rl_token_encoder(vlm_features)                 # [1, 960]
 
         # RL Actor -> a
-        x = torch.cat([z_rl, s_p], dim=-1)   # [1, 280]
+        x = torch.cat([z_rl, s_p], dim=-1)   # [1, 984]
         a = actor.sample(x, a_tilde)           # [1, 12, 12]
 
-        # Execute chunk, collect rewards
+        # Execute chunk, collect per-step obs and rewards
+        step_obs = [obs]
         rewards = []
         for t in range(C):
             obs, r, terminated, truncated, info = env.step(a[:, t, :])
+            step_obs.append(obs)
             rewards.append(r)
             if terminated or truncated:
                 done = True
                 break
 
-        # Chunk-level discounted return
-        chunk_return = sum(gamma**t * r for t, r in enumerate(rewards))
+        # Sub-sampled transitions (stride=2)
+        for start in range(0, len(rewards), 2):
+            sub_rewards = rewards[start:]
+            sub_return = sum(gamma**t * r for t, r in enumerate(sub_rewards))
 
-        # Store transition
-        replay_buffer.add(z_rl, s_p, a_tilde, a, chunk_return, next_z_rl, next_s_p, done)
+            replay_buffer.add(
+                z_rl=z_rl,                             # reuses chunk-start z_rl
+                s_p=step_obs[start]["observation.state"] + step_obs[start]["joint_vel"],
+                ref_action=a_tilde[:, start:, :],      # sliced reference
+                action=a[:, start:, :],                # sliced action
+                reward=sub_return,
+                next_z_rl=z_rl_next,                   # next chunk's z_rl
+                next_s_p=...,
+                done=done if start + len(sub_rewards) >= C else False,
+            )
 
-        # Off-policy update
-        for _ in range(G):  # G = update-to-data ratio
+        # Off-policy update (update-to-data ratio G=5)
+        for _ in range(G):
             batch = replay_buffer.sample()
-            update_critic(batch)    # 2x per actor update
-            update_actor(batch)     # 1x
+            update_critic(batch)       # 2x per iteration
+            update_critic(batch)
+            update_actor(batch)        # 1x per iteration
 ```
 
 ### Decision E: RL Token Training Data Source
@@ -224,7 +256,7 @@ for p in policy.parameters():
     p.requires_grad = False
 
 # Create trainable RL Token module
-rl_token_module = RLTokenModule(hidden_dim=960, proj_dim=256)
+rl_token_module = RLTokenModule(hidden_dim=960)  # no projection -- z_rl = 960D
 optimizer = Adam(rl_token_module.parameters(), lr=1e-4)
 
 # Iterate over demonstration dataset
@@ -252,7 +284,7 @@ for epoch in range(N_epochs):
             )
             z_vlm = outputs_embeds[0]  # [B, M, 960] post-RMSNorm
 
-        z_rl = rl_token_module.encode(z_vlm)           # [B, 256]
+        z_rl = rl_token_module.encode(z_vlm)           # [B, 960]
         loss_ro = rl_token_module.decode_loss(z_rl, z_vlm)
 
         optimizer.zero_grad()
@@ -273,7 +305,7 @@ for epoch in range(N_epochs):
 1. Paper Appendix B explicitly uses position + velocity
 2. Contact dynamics in garment manipulation depend on velocity (grasp force, drag speed)
 3. Isaac Lab `Articulation.data.joint_vel` is readily available -- zero implementation cost
-4. Actor input changes from 412D to 424D -- negligible dimension increase
+4. Actor input changes from 1116D to 1128D -- negligible dimension increase
 
 **Implementation:** Add `joint_vel` to `_get_observations()` or extract directly from `Articulation.data.joint_vel` in the RL training loop.
 
@@ -303,7 +335,7 @@ for epoch in range(N_epochs):
 | Shaping option | Rejected because |
 |----------------|-----------------|
 | Lower step_interval (e.g. 10) | 5x compute overhead; marginal benefit over already-dense reward |
-| Action smoothness penalty | BC regularization `beta * ||a - a_tilde||^2` already constrains smoothness |
+| Action smoothness penalty | BC regularization `beta * \|\|a - a_tilde\|\|^2` already constrains smoothness |
 | Progress reward | Bellman backup `Q = r + gamma*V(s')` implicitly captures progress |
 | Success bonus amplification | Critic's TD learning naturally amplifies terminal rewards |
 
@@ -321,7 +353,7 @@ New files:
   ├── rl_token.py                  # RLTokenEncoder + RLTokenDecoder
   ├── actor.py                     # RLActor (Gaussian, conditioned on a_tilde)
   ├── critic.py                    # TwinCritic (TD3 style)
-  ├── sac_trainer.py               # Off-policy trainer + ReplayBuffer
+  ├── rlt_trainer.py               # TD3+BC trainer + ReplayBuffer (NOT SAC)
   └── vla_rl_policy.py             # Unified VLA-RL policy wrapper
 
   scripts/
@@ -331,6 +363,8 @@ New files:
       └── rlt_policy.py            # Evaluation policy wrapper
 ```
 
+**Note on naming:** The trainer is `rlt_trainer.py` (not `sac_trainer.py`). The algorithm is TD3+BC (twin critic, delayed actor, fixed sigma, BC regularization), not SAC (which uses entropy maximization and learned temperature).
+
 ## 4. Key Module Specifications
 
 ### RLTokenEncoder
@@ -339,18 +373,21 @@ New files:
 class RLTokenEncoder(nn.Module):
     """
     Input:  z_{1:M} [B, M, 960] (post-RMSNorm VLM features)
-    Output: z_rl [B, 256] (compact RL token)
+    Output: z_rl [B, 960] (RL token, SAME dimension as VLM hidden -- no compression)
 
     Architecture:
     - Prepend 1 learnable token e_rl [1, 1, 960]
     - 4-layer TransformerEncoder (dim=960, heads=16)
-    - Extract e_rl position output -> z_raw [B, 960]
-    - Project: Linear(960 -> 256) -> z_rl [B, 256]
+    - Extract e_rl position output -> z_rl [B, 960]
+
+    Note: pi0.6 paper uses z_rl dim = VLM hidden dim (2048) with NO projection.
+    We follow the same design: z_rl dim = 960 = SmolVLA hidden dim.
+    This avoids over-compression and makes decoder reconstruction easier.
     """
-    def __init__(self, hidden_dim=960, proj_dim=256, num_layers=4, num_heads=16):
+    def __init__(self, hidden_dim=960, num_layers=4, num_heads=16):
         self.rl_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
         self.encoder = nn.TransformerEncoder(...)
-        self.projection = nn.Linear(hidden_dim, proj_dim)
+        # NO projection layer -- output is 960D
 ```
 
 ### RLTokenDecoder
@@ -358,13 +395,13 @@ class RLTokenEncoder(nn.Module):
 ```python
 class RLTokenDecoder(nn.Module):
     """
-    Input:  z_rl [B, 256] + sg(z_{1:M}) [B, M, 960]
+    Input:  z_rl [B, 960] + sg(z_{1:M}) [B, M, 960]
     Output: L_ro = sum ||h_phi(d_phi([z_rl, sg(z_1:i-1)]))_i - sg(z_i)||^2
 
     Autoregressive reconstruction. Forces z_rl to preserve task-relevant info.
     """
-    def __init__(self, hidden_dim=960, proj_dim=256, num_layers=4, num_heads=16):
-        self.inv_projection = nn.Linear(proj_dim, hidden_dim)
+    def __init__(self, hidden_dim=960, num_layers=4, num_heads=16):
+        # NO inv_projection -- z_rl is already 960D
         self.decoder = nn.TransformerDecoder(...)
         self.output_proj = nn.Linear(hidden_dim, hidden_dim)
 ```
@@ -375,13 +412,13 @@ class RLTokenDecoder(nn.Module):
 class RLActor(nn.Module):
     """
     pi_theta(a_{1:C} | x, a_tilde) = N(mu_theta(x, a_tilde), sigma^2 * I)
-    x = [z_rl(256), s_p(24)] = 280D
-    input = [x(280), a_tilde_flat(144)] = 424D
-    MLP: 424 -> 512 -> 512 -> 144
+    x = [z_rl(960), s_p(24)] = 984D
+    input = [x(984), a_tilde_flat(144)] = 1128D
+    MLP: 1128 -> 512 -> 512 -> 144
     Reference action dropout: 50% during training
     """
-    def __init__(self, rl_dim=256, state_dim=24, chunk=12, action_dim=12):
-        input_dim = rl_dim + state_dim + chunk * action_dim  # 424
+    def __init__(self, rl_dim=960, state_dim=24, chunk=12, action_dim=12):
+        input_dim = rl_dim + state_dim + chunk * action_dim  # 1128
         self.net = nn.Sequential(
             nn.Linear(input_dim, 512), nn.ReLU(),
             nn.Linear(512, 512), nn.ReLU(),
@@ -396,12 +433,12 @@ class RLActor(nn.Module):
 class TwinCritic(nn.Module):
     """
     Q_psi(x, a_{1:C}) -> scalar
-    input = [x(280), a_flat(144)] = 424D
-    Q1, Q2: 424 -> 512 -> 512 -> 1
+    input = [x(984), a_flat(144)] = 1128D
+    Q1, Q2: 1128 -> 512 -> 512 -> 1
     min(Q1, Q2) for Bellman backup
     """
-    def __init__(self, rl_dim=256, state_dim=24, chunk=12, action_dim=12):
-        input_dim = rl_dim + state_dim + chunk * action_dim  # 424
+    def __init__(self, rl_dim=960, state_dim=24, chunk=12, action_dim=12):
+        input_dim = rl_dim + state_dim + chunk * action_dim  # 1128
         self.q1 = QNetwork(input_dim, hidden=512)
         self.q2 = QNetwork(input_dim, hidden=512)
 ```
@@ -442,19 +479,20 @@ return outputs_embeds, past_key_values, outputs_embeds[0]  # 3rd = z_{1:M} post-
 | Parameter | Value | Source |
 |-----------|-------|--------|
 | RL Token count | 1 | Paper Fig.2 |
-| z_rl dimension | 256 (projected from 960) | Design choice |
+| z_rl dimension | **960** (no projection, = VLM hidden dim) | Paper design (pi0.6: 2048 = VLM hidden) |
 | RL chunk C | 12 | Matches n_action_steps |
 | VLA chunk H | 50 | SmolVLA config |
+| Sub-sampling stride | 2 | Paper Section V |
 | Actor hidden dim | 512 | Paper Appendix B |
 | Critic hidden dim | 512 | Paper Appendix B |
-| Actor layers | 3 (424->512->512->144) | Paper Appendix B |
+| Actor layers | 3 (1128->512->512->144) | Paper Appendix B |
 | Critic layers | 3 per Q-network | Paper Appendix B |
 | Encoder layers | 4 transformer layers | Design choice |
 | Decoder layers | 4 transformer layers | Design choice |
 | Update-to-data ratio G | 5 | Paper Section V |
-| Critic/Actor update ratio | 2:1 | Paper Appendix B |
+| Critic/Actor update ratio | **2:1** (2 critic per 1 actor, within each G iteration) | Paper Appendix B |
 | Reference action dropout | 50% | Paper Section IV-B |
-| BC regularization beta | 1.0 (tunable) | Paper Eq.5 |
+| BC regularization beta | **0.1** (initial, tunable) | Paper Eq.5; lower for dense reward |
 | Discount factor gamma | 0.99 | Standard |
 | Actor sigma (fixed std) | exp(-5) ~ 0.0067 | Paper Appendix B |
 | RL Token training steps | 2000-10000 per garment type | Paper Appendix B |
@@ -462,7 +500,20 @@ return outputs_embeds, past_key_values, outputs_embeds[0]  # 3rd = z_{1:M} post-
 | RL total episodes | 400-1000 per garment type | Paper Appendix B |
 | Optimizer | Adam | Standard |
 | RL Token encoder lr | 1e-4 | Paper (implied) |
-| Actor/Critic lr | 3e-4 (TBD) | Standard SAC |
+| Actor/Critic lr | 3e-4 (TBD) | Standard |
+
+### Why z_rl = 960 (not 256)
+
+The original plan used z_rl = 256 via a projection layer. This was revised to 960 (no projection) for the following reasons:
+
+1. **Paper uses no compression**: pi0.6's z_rl = 2048 = VLM hidden dim. The RL Token Encoder only compresses token count (M -> 1), not dimension.
+2. **Reconstruction difficulty**: Decoder must reconstruct M x 960 from a single z_rl. With z_rl = 256, the compression ratio is ~M*3.75x, making L_ro much harder to converge.
+3. **Actor dimension still manageable**: Actor input = 960 + 24 + 144 = 1128D. With 3-layer MLP at 512 hidden, this is well within standard practice.
+4. **No information bottleneck needed**: The bottleneck is already in token count (M -> 1). Adding dimensional compression is redundant and harmful.
+
+### Why beta = 0.1 (not 1.0)
+
+The paper tuned beta for sparse binary rewards (Q values ~0-10). Our dense [0,1] reward produces stronger critic gradients. Starting at beta = 0.1 allows the actor to trust the critic signal more while still preventing divergence. This can be tuned upward if the actor explores too aggressively.
 
 ## 7. Training Pipeline
 
@@ -474,13 +525,13 @@ Output: RL Token Encoder weights (per garment type)
 
   for garment_type in [top_long, top_short, pant_long, pant_short]:
     dataset = LeRobotDataset(garment_type)
-    encoder = RLTokenEncoder(hidden_dim=960, proj_dim=256)
+    encoder = RLTokenEncoder(hidden_dim=960)      # z_rl = 960D, no projection
     decoder = RLTokenDecoder(hidden_dim=960)
 
     for step in range(2000-10000):
       batch = sample(dataset)
       z_vlm = prefix_pass(frozen_vla, batch)        # [B, M, 960]
-      z_rl = encoder(z_vlm)                          # [B, 256]
+      z_rl = encoder(z_vlm)                          # [B, 960]
       loss_ro = decoder.reconstruction_loss(z_rl, z_vlm)
       loss_ro.backward()
       optimizer.step()
@@ -495,8 +546,8 @@ Output: Actor + Critic weights (per garment type)
 
   for garment_type in [top_long, top_short, pant_long, pant_short]:
     encoder = load("rl_token_encoder_{garment_type}.pt")
-    actor = RLActor(rl_dim=256, state_dim=24, chunk=12, action_dim=12)
-    critic = TwinCritic(rl_dim=256, state_dim=24, chunk=12, action_dim=12)
+    actor = RLActor(rl_dim=960, state_dim=24, chunk=12, action_dim=12)
+    critic = TwinCritic(rl_dim=960, state_dim=24, chunk=12, action_dim=12)
     buffer = ReplayBuffer()
 
     # Warmup
@@ -510,11 +561,17 @@ Output: Actor + Critic weights (per garment type)
         a_tilde, z_rl = vla_forward(frozen_vla, frozen_encoder, obs)
         a = actor.sample(z_rl, s_p, a_tilde)
         rewards = execute_chunk(env, a, C=12)
-        buffer.add(z_rl, s_p, a_tilde, a, rewards, ...)
-        for g in range(5):
-          update_critic(critic, buffer)
-          if g % 2 == 0:
-            update_actor(actor, critic, buffer)
+
+        # Sub-sampled transitions (stride=2)
+        buffer.add_subsampled(z_rl, s_p, a_tilde, a, rewards, stride=2)
+
+        # Off-policy update: 2 critic + 1 actor per iteration
+        for _ in range(G):
+          batch = buffer.sample()
+          update_critic(batch)    # critic update #1
+          update_critic(batch)    # critic update #2
+          update_actor(batch)     # actor update #1
+          # Total: 2 critic : 1 actor ratio per iteration
 
     save("rl_actor_{garment_type}.pt")
     save("rl_critic_{garment_type}.pt")
@@ -526,6 +583,7 @@ Output: Actor + Critic weights (per garment type)
 |--------|-------------------|-----------------|----------------|
 | VLM backbone | SigLIP(400M) + Gemma(4B) | SmolVLM2-500M (16 layers) | Smaller but sufficient |
 | VLM hidden dim | 2048 | 960 | z_{1:M} dimension differs |
+| z_rl dim | 2048 (= VLM hidden, no proj) | **960 (= VLM hidden, no proj)** | Consistent design |
 | Action Expert | 860M, separate module | 0.75x width (720), interleaved | Interleaved but isolated by attention mask |
 | VLM-Expert compute | Serial (VLM then Expert) | Interleaved (same loop) | No impact on z_{1:M} extraction |
 | Information flow | VLM -> Expert (one-way) | VLM -> Expert (one-way, same) | Equivalent for RLT |
@@ -565,10 +623,10 @@ In both pi0.6 and SmolVLA, the VLM branch never attends to Action Expert tokens 
 | Risk | Likelihood | Mitigation |
 |------|-----------|------------|
 | VLM features insufficient for RL Token | Low | SmolVLA already produces effective actions; features contain task-relevant info |
-| RL Token encoder fails to converge | Medium | Monitor L_ro loss; increase training steps; try larger encoder |
-| Actor diverges from VLA behavior | Medium | BC regularization beta; reference action dropout; tune beta upward |
+| RL Token encoder fails to converge | Low | z_rl=960 (no compression) makes reconstruction easier; monitor L_ro loss |
+| Actor diverges from VLA behavior | Medium | BC regularization beta (start 0.1, tune upward); reference action dropout |
 | Reward too sparse at 50-step interval | Low | Can reduce step_interval to 10 if needed |
-| Sim-to-real gap (future) | N/A (sim only) | N/A for current scope |
+| Sub-sampling stride=2 implementation complexity | Medium | Start with stride=C (chunk-level) as fallback; add stride=2 as optimization |
 | Compute budget (CPU-only sim) | Medium | Profile VLA forward time; consider async rollout/update |
 
 ## 11. Implementation Order
@@ -579,6 +637,17 @@ In both pi0.6 and SmolVLA, the VLM branch never attends to Action Expert tokens 
 | 1 | Implement RL Token Encoder + Decoder | `rl/rl_token.py` | Medium |
 | 2 | Implement Actor + Critic | `rl/actor.py`, `rl/critic.py` | Medium |
 | 3 | Stage 1 training script | `scripts/train_rl_token.py` | Medium |
-| 4 | SAC trainer + replay buffer | `rl/sac_trainer.py` | Medium |
+| 4 | RLT trainer + replay buffer | `rl/rlt_trainer.py` | Medium |
 | 5 | Stage 2 online RL script | `scripts/train_rl_online.py` | Large |
 | 6 | Evaluation policy wrapper | `scripts/eval_policy/rlt_policy.py` | Small |
+
+## 12. Revision History
+
+| Date | Change | Reason |
+|------|--------|--------|
+| 2026-04-02 | Initial plan | Based on 7 structural decisions (A-G) |
+| 2026-04-02 | **z_rl: 256 -> 960** | Paper uses no projection (z_rl = VLM hidden dim); 256 over-compresses and makes decoder reconstruction harder |
+| 2026-04-02 | **Sub-sampling: chunk-level -> stride=2** | Paper Section V explicitly uses stride=2 for ~6x data efficiency |
+| 2026-04-02 | **Critic:Actor ratio: 5:3 -> 2:1** | Fix pseudocode bug; paper Appendix B specifies 2 critic per 1 actor update |
+| 2026-04-02 | **beta: 1.0 -> 0.1** | Dense reward produces stronger critic gradients; lower BC regularization allows actor to trust critic more |
+| 2026-04-02 | **Trainer naming: sac_trainer -> rlt_trainer** | Algorithm is TD3+BC (twin critic, fixed sigma, BC reg), not SAC (entropy maximization) |
