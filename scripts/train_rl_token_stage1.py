@@ -64,13 +64,14 @@ def train(cfg: dict):
     print(f"  Loaded {len(cache)} frames")
 
     sample = cache[0]
-    print(f"  Sample shape: {sample.shape}  (expected [196, 960])")
+    total_tokens = sample.shape[0]
+    d_model = sample.shape[1]
+    print(f"  Sample shape: {sample.shape}  (total_tokens={total_tokens}, d_model={d_model})")
 
-    hook_temp = VLAPrefixHook(device="cpu")
-    num_img_tokens = hook_temp.num_image_tokens
-    num_lang_tokens = hook_temp.num_lang_tokens
-    num_state_tokens = hook_temp.num_state_tokens
-    del hook_temp
+    num_img_tokens = cfg.get("num_image_tokens", 192)
+    num_lang_tokens = cfg.get("num_lang_tokens", 3)
+    num_state_tokens = total_tokens - num_img_tokens - num_lang_tokens
+    print(f"  Token layout: {num_img_tokens} image + {num_lang_tokens} lang + {num_state_tokens} state = {total_tokens}")
 
     dataset = PrefixEmbeddingDataset(cache)
     dataloader = DataLoader(
@@ -165,7 +166,7 @@ def train(cfg: dict):
             log_entry = {
                 "step": step + 1,
                 "loss": loss.item(),
-                "grad_norm": grad_norm,
+                "grad_norm": grad_norm.item(),
                 "lr": lr,
                 "z_rl_norm": result["z_rl"].norm(dim=-1).mean().item(),
                 "elapsed_s": elapsed,
