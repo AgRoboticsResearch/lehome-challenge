@@ -150,7 +150,7 @@ class VLAPrefixHook:
 
     @property
     def num_image_tokens(self) -> int:
-        return 64 * len(self.image_keys) * len(self.image_keys)
+        return 64 * len(self.image_keys)
 
     @property
     def num_state_tokens(self) -> int:
