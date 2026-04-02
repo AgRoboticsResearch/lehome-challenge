@@ -1,0 +1,23 @@
+dataset_root: Datasets/example/top_long_merged
+smolvla_pretrained_path: null
+output_dir: outputs/rl_token/stage1
+prefix_cache_path: outputs/rl_token/prefix_cache_top_long.pt
+task_description: "fold the garment"
+
+batch_size: 64
+steps: 5000
+lr: 1.0e-4
+weight_decay: 1.0e-4
+grad_clip: 1.0
+warmup_steps: 200
+
+encoder_layers: 2
+decoder_layers: 2
+num_heads: 15
+dim_feedforward: 1920
+d_model: 960
+
+save_freq: 1000
+log_freq: 100
+device: cpu
+seed: 42
