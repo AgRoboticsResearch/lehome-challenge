@@ -145,8 +145,12 @@ class VLAPrefixHook:
         return self._num_lang_tokens
 
     @property
-    def num_image_tokens(self) -> int:
+    def num_image_tokens_per_camera(self) -> int:
         return 64
+
+    @property
+    def num_image_tokens(self) -> int:
+        return 64 * len(self.image_keys) * len(self.image_keys)
 
     @property
     def num_state_tokens(self) -> int:
