@@ -59,37 +59,48 @@ def train(cfg: dict):
         print("Run with --precompute first.")
         return
 
-    # Memory-mapped tensor format: avoids loading ~30GB dict into RAM
-    mmap_path = prefix_cache_path.with_suffix(".mmap.pt")
+    # Memory-mapped binary format: avoids loading ~30GB into RAM
+    import numpy as np
 
-    if mmap_path.exists():
-        cache_tensor = torch.load(mmap_path, map_location="cpu", mmap=True, weights_only=True)
-        num_frames, total_tokens, d_model = cache_tensor.shape
+    mmap_path = prefix_cache_path.with_suffix(".mmap.bin")
+    meta_path = prefix_cache_path.with_suffix(".meta.pt")
+
+    if meta_path.exists():
+        meta = torch.load(meta_path, weights_only=True)
+        num_frames = meta["num_frames"]
+        total_tokens = meta["total_tokens"]
+        d_model = meta["d_model"]
+        arr = np.memmap(str(mmap_path), dtype="float16", mode="r",
+                        shape=(num_frames, total_tokens, d_model))
+        cache_tensor = torch.from_numpy(arr)
         print(f"Loaded {num_frames} frames from {mmap_path} (memory-mapped)")
-        print(f"  Shape: [{num_frames}, {total_tokens}, {d_model}]")
     else:
-        # One-time conversion: dict -> stacked tensor
+        # One-time conversion: dict -> binary memmap (minimal RAM)
         print(f"Loading prefix cache from {prefix_cache_path} ...")
-        cache = torch.load(prefix_cache_path, map_location="cpu", weights_only=True)
-        print(f"  Loaded {len(cache)} frames")
+        cache = torch.load(prefix_cache_path, map_location="cpu", mmap=True, weights_only=True)
+        indices = sorted(cache.keys())
+        num_frames = len(indices)
+        print(f"  Loaded {num_frames} frames (tensors memory-mapped)")
 
-        sample = cache[0]
+        sample = cache[indices[0]]
         total_tokens = sample.shape[0]
         d_model = sample.shape[1]
-        print(f"  Sample shape: {sample.shape}  (total_tokens={total_tokens}, d_model={d_model})")
+        print(f"  Sample shape: [{total_tokens}, {d_model}]")
 
-        print("  Converting to memory-mapped tensor format ...")
-        indices = sorted(cache.keys())
-        stacked = torch.empty(len(indices), total_tokens, d_model, dtype=sample.dtype)
+        print("  Converting to memory-mapped binary format ...")
+        arr = np.memmap(str(mmap_path), dtype="float16", mode="w+",
+                        shape=(num_frames, total_tokens, d_model))
         for i, idx in enumerate(indices):
-            stacked[i] = cache.pop(idx)  # free dict memory progressively
-        del cache
+            arr[i] = cache[idx].numpy()
+        arr.flush()
+        del cache, arr
 
-        torch.save(stacked, mmap_path)
-        print(f"  Saved tensor cache to {mmap_path}")
+        torch.save({"num_frames": num_frames, "total_tokens": total_tokens, "d_model": d_model}, meta_path)
+        print(f"  Saved to {mmap_path} + {meta_path}")
 
-        cache_tensor = torch.load(mmap_path, map_location="cpu", mmap=True, weights_only=True)
-        del stacked
+        arr = np.memmap(str(mmap_path), dtype="float16", mode="r",
+                        shape=(num_frames, total_tokens, d_model))
+        cache_tensor = torch.from_numpy(arr)
 
     num_img_tokens = cfg.get("num_image_tokens", 192)
     num_lang_tokens = cfg.get("num_lang_tokens", 3)
