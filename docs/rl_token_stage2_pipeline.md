@@ -56,13 +56,28 @@ Every C=10 steps:
    action_cpu = action_raw.cpu().numpy()
 
 6. EXECUTE open-loop on CPU (C=10 sim steps)
+   rewards = []
    for t in range(C):
-     obs_t, reward_t, done_t = env.step(action_cpu[t])  # CPU sim
-   Collect: rewards[], done
+     obs_t, reward_t, done_t = env.step(action_cpu[t])
+     rewards.append(reward_t)
+     if done_t:
+       break                          # early termination on episode boundary
+   n_exec = len(rewards)
+   chunk_return = Σ_{t=0}^{n_exec-1} γ^t * r_t
 
 7. STORE in replay buffer (on GPU)
-   chunk_return = Σ γ^t * r_t
-   (z_rl, s_p, ref, action, chunk_return, next_z_rl, next_s_p, done)
+   if n_exec < C:                              # partial chunk (episode ended mid-chunk)
+     action_stored = action_chunk.clone()
+     action_stored[:, n_exec:] = 0              # zero-pad unexecuted actions
+   else:
+     action_stored = action_chunk
+
+   if done:
+     next_z_rl = zeros, next_s_p = zeros        # terminal state
+   else:
+     next_z_rl, next_s_p = process_observation(obs_t, ...)
+
+   (z_rl, s_p, ref, action_stored, chunk_return, next_z_rl, next_s_p, done)
 
 8. OFF-POLICY UPDATE on GPU (G=5 iterations)
    batch = replay_buffer.sample(256)
@@ -159,6 +174,36 @@ class SimpleNormalizer:
 > **Replay buffer stores joint_pos in normalized space, z_rl in raw space, actions in normalized space.**
 > BC loss `||a - ã||²` compares normalized actions, naturally aligned because VLA outputs
 > are also in normalized space. z_rl is stored as-is (no normalization).
+
+### Episode boundary handling (partial chunks)
+
+When episode ends mid-chunk (e.g. C=10 but done=True at step 5):
+
+```
+Scenario: C=10, episode ends at step 5
+
+Execute:  steps 0-4 only (5 of 10)
+  for t in range(C):
+    obs, r, d = env.step(action[t])
+    rewards.append(r)
+    if d: break                                # stop immediately
+
+Store:
+  n_exec = 5                                   # actual steps executed
+  chunk_return = Σ_{t=0}^{4} γ^t * r_t        # only 5 terms
+  action_stored[:, 5:] = 0                      # zero-pad phantom steps
+  done = True
+  next_z_rl = zeros                             # terminal → zero next state
+  next_s_p = zeros
+
+Why this is safe:
+  TD target = chunk_return + γ^C * (1-done) * Q_target(s', a')
+                     = chunk_return + 0              ← (1-done) = 0 when done=True
+                     = chunk_return                 ← phantom actions never affect learning
+
+  The zero-padded phantom actions reduce critic variance when done=True,
+  though mathematically any value would work since the bootstrapping term is zeroed.
+```
 
 ---
 
@@ -286,6 +331,7 @@ class RLTTrainer:
         """
         # chunk_return already = Σ γ^t * r_t (discounted within chunk)
         # next state is C steps away → use γ^C, not γ
+        # partial chunk (n_exec < C): done=True → (1-d)=0 → target = chunk_return only
         target = r + γ^C * (1-d) * min(Q1_t, Q2_t)
         loss = MSE(Q1, target) + MSE(Q2, target)
         """
