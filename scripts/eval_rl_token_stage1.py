@@ -106,13 +106,15 @@ def load_dataset_info(dataset_root: str, num_frames_cap: int):
 
     # Fast path: try reading from parquet columns directly
     try:
+        import pyarrow as pa
         import pyarrow.parquet as pq
 
         parquet_dir = Path(dataset_root) / "data"
         parquet_files = sorted(parquet_dir.glob("**/*.parquet"))
         if parquet_files:
             print(f"  Fast-loading from {len(parquet_files)} parquet file(s) ...")
-            table = pq.concat_tables([pq.read_table(f) for f in parquet_files])
+            tables = [pq.read_table(f) for f in parquet_files]
+            table = pa.concat_tables(tables)
 
             actions = torch.from_numpy(
                 np.stack(table.column("action").to_numpy())
