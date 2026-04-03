@@ -388,7 +388,8 @@ def main():
 
     # Worst tokens
     per_tok = recon["per_token_cos_sim"]
-    worst_v, worst_i = per_tok.sort()[:5]
+    sorted_tok = per_tok.sort()
+    worst_v, worst_i = sorted_tok.values[:5], sorted_tok.indices[:5]
     print(f"\n  Worst 5 tokens:")
     for v, idx in zip(worst_v, worst_i):
         if idx < 64:
