@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "source" / "lehome"))
@@ -45,10 +46,8 @@ def load_prefix_cache(cache_path: str):
         meta_path = cache_path.with_suffix(".meta.pt")
     elif cache_path.suffix == ".bin":
         mmap_path = cache_path
-        # e.g. prefix_cache_top_long.mmap.bin → prefix_cache_top_long.meta.pt
         meta_path = cache_path.parent / cache_path.name.replace(".mmap.bin", ".meta.pt")
     else:
-        # No extension: try .mmap.bin / .meta.pt
         mmap_path = cache_path.with_suffix(".mmap.bin")
         meta_path = cache_path.with_suffix(".meta.pt")
 
@@ -63,7 +62,6 @@ def load_prefix_cache(cache_path: str):
         print(f"  Loaded mmap cache: {num_frames} frames, {total_tokens} x {d_model}")
         return data, num_frames, total_tokens, d_model
 
-    # Fallback: .pt format (slow, may use lots of RAM)
     pt_path = cache_path.with_suffix(".pt") if cache_path.suffix != ".pt" else cache_path
     if pt_path.exists():
         print(f"  Loading from .pt: {pt_path} (consider converting to mmap first)")
@@ -97,31 +95,55 @@ def load_model(checkpoint_path: str, device: torch.device):
 
 
 def load_dataset_info(dataset_root: str, num_frames_cap: int):
-    """Load actions, states, and episode indices from LeRobot dataset."""
+    """Load actions, states, and episode indices from LeRobot dataset.
+
+    Tries fast parquet column read first, falls back to sequential loading.
+    """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     ds = LeRobotDataset(repo_id=Path(dataset_root).name, root=Path(dataset_root))
     N = min(len(ds), num_frames_cap)
 
+    # Fast path: try reading from parquet columns directly
+    try:
+        import pyarrow.parquet as pq
+
+        parquet_dir = Path(dataset_root) / "data"
+        parquet_files = sorted(parquet_dir.glob("train-*.parquet"))
+        if parquet_files:
+            print(f"  Fast-loading from {len(parquet_files)} parquet file(s) ...")
+            table = pq.concat_tables([pq.read_table(f) for f in parquet_files])
+
+            actions = torch.from_numpy(
+                np.stack(table.column("action").to_numpy())
+            ).float()[:N]
+            states = torch.from_numpy(
+                np.stack(table.column("observation.state").to_numpy())
+            ).float()[:N]
+            episode_indices = torch.from_numpy(
+                np.array(table.column("episode_index").to_numpy())
+            ).long()[:N]
+            return actions, states, episode_indices, N
+    except Exception as e:
+        print(f"  Fast path failed ({e}), using sequential loading ...")
+
+    # Slow fallback: iterate one by one
     actions = torch.zeros(N, 12)
     states = torch.zeros(N, 12)
     episode_indices = torch.zeros(N, dtype=torch.long)
 
-    for i in range(N):
+    for i in tqdm(range(N), desc="  Loading dataset", ncols=80):
         frame = ds[i]
-        # Action
         act = frame["action"]
         if not isinstance(act, torch.Tensor):
             act = torch.from_numpy(np.asarray(act))
         actions[i] = act.float()
-        # State
         s = frame.get("observation.state", frame.get("state"))
         if not isinstance(s, torch.Tensor):
             s = torch.from_numpy(np.asarray(s))
         if s.ndim > 1:
             s = s.squeeze()
         states[i] = s.float()
-        # Episode index
         ep = frame.get("episode_index", 0)
         if isinstance(ep, torch.Tensor):
             ep = ep.item()
@@ -166,9 +188,9 @@ def eval_reconstruction(model, data, device, num_samples=2000, batch_size=256):
             "left":  all_cos[:, 64:128].mean().item(),
             "right": all_cos[:, 128:192].mean().item(),
         },
-        "first_token_cos_sim": per_token[0].item(),  # predicted from z_rl only
+        "first_token_cos_sim": per_token[0].item(),
         "last_token_cos_sim": per_token[-1].item(),
-        "per_token_cos_sim": per_token,  # (193,) tensor for detailed analysis
+        "per_token_cos_sim": per_token,
     }
 
 
@@ -177,7 +199,7 @@ def encode_all_zrl(model, data, device, batch_size=256):
     """Encode all frames to z_rl vectors."""
     N = data.shape[0]
     z_rls = []
-    for i in range(0, N, batch_size):
+    for i in tqdm(range(0, N, batch_size), desc="  Encoding z_rl", ncols=80):
         batch = data[i : i + batch_size].to(device=device, dtype=torch.float32)
         z_target = model.apply_keep_mask(batch)
         z_rl = model.encoder(z_target)
@@ -190,7 +212,7 @@ def compute_z_target_mean(data, keep_mask, batch_size=256):
     """Mean-pooled z_target as baseline (same 960D as z_rl)."""
     N = data.shape[0]
     means = []
-    for i in range(0, N, batch_size):
+    for i in tqdm(range(0, N, batch_size), desc="  Mean pooling", ncols=80):
         batch = data[i : i + batch_size].float()
         z_target = batch[:, keep_mask, :]  # (B, 193, 960)
         means.append(z_target.mean(dim=1))  # (B, 960)
@@ -227,7 +249,7 @@ def _train_probe(X_train, y_train, X_val, y_val, device, epochs=50, lr=1e-3):
     return best_val_loss
 
 
-def eval_linear_probe(model, data, actions, states, episode_indices, N, device):
+def eval_linear_probe(z_rls, z_target_means, actions, states, episode_indices, N, device):
     """Linear probe: compare z_rl vs baselines for action prediction.
 
     Three probes with fair comparison:
@@ -235,14 +257,6 @@ def eval_linear_probe(model, data, actions, states, episode_indices, N, device):
       2. z_target_mean (960D) — naive mean pooling of VLM tokens
       3. state (12D)           — raw joint positions (lower bound)
     """
-    print("  Encoding all frames to z_rl ...")
-    t0 = time.time()
-    z_rls = encode_all_zrl(model, data[:N], device)
-    print(f"    Done: {z_rls.shape} in {time.time()-t0:.1f}s")
-
-    print("  Computing z_target mean pooling baseline ...")
-    z_target_means = compute_z_target_mean(data[:N], model.keep_mask)
-
     # Split by episode (avoid leakage from adjacent frames)
     unique_eps = episode_indices.unique()
     n_train_eps = int(len(unique_eps) * 0.8)
@@ -381,12 +395,10 @@ def main():
     for cam in ("top", "left", "right"):
         print(f"    {cam:>5s}: {recon['per_camera'][cam]:.4f}")
 
-    # Teacher forcing analysis: first token predicted from z_rl only
     print(f"\n  Teacher-forcing analysis:")
     print(f"    1st token (z_rl only): {recon['first_token_cos_sim']:.4f}")
     print(f"    Last token (full ctx):  {recon['last_token_cos_sim']:.4f}")
 
-    # Worst tokens
     per_tok = recon["per_token_cos_sim"]
     sorted_tok = per_tok.sort()
     worst_v, worst_i = sorted_tok.values[:5], sorted_tok.indices[:5]
@@ -408,20 +420,35 @@ def main():
         k: v for k, v in recon.items() if k != "per_token_cos_sim"
     }
 
-    # ── 2. Linear Probe (requires dataset) ────────────────────
+    # ── 2 & 3. Linear Probe + Temporal (require dataset) ──────
     if has_dataset:
+        # Load dataset once
+        print("\n" + "─" * 50)
+        print("  Loading dataset for linear probe & temporal ...")
+        print("─" * 50)
+        t_load = time.time()
+        actions, states, episode_indices, N = load_dataset_info(
+            args.dataset_root, num_frames
+        )
+        print(f"  Loaded {N} frames ({time.time()-t_load:.1f}s)")
+
+        # Encode z_rl ONCE, reuse for both probe and temporal
+        print("\n  Encoding all frames to z_rl ...")
+        t_enc = time.time()
+        z_rls = encode_all_zrl(model, data[:N], device)
+        print(f"  Done: {z_rls.shape} ({time.time()-t_enc:.1f}s)")
+
+        # Compute mean pooling baseline
+        z_target_means = compute_z_target_mean(data[:N], model.keep_mask)
+
+        # ── 2. Linear Probe ───────────────────────────────────
         print("\n" + "─" * 50)
         print("  2. Linear Probe (z_rl → action prediction)")
         print("─" * 50)
 
         t0 = time.time()
-        actions, states, episode_indices, N = load_dataset_info(
-            args.dataset_root, num_frames
-        )
-        print(f"  Loaded {N} frames from dataset")
-
         probe = eval_linear_probe(
-            model, data, actions, states, episode_indices, N, device
+            z_rls, z_target_means, actions, states, episode_indices, N, device
         )
         all_results["linear_probe"] = probe
 
@@ -432,17 +459,14 @@ def main():
         print(f"    vs mean pooling:     {probe['improvement_vs_mean_pooling_pct']:+.1f}%")
         print(f"    vs state only:       {probe['improvement_vs_state_pct']:+.1f}%")
         print(f"  ({time.time()-t0:.1f}s)")
-    else:
-        print("\n  [Linear probe skipped — provide --dataset_root to enable]")
 
-    # ── 3. Temporal Consistency (requires dataset) ────────────
-    if has_dataset:
+        # ── 3. Temporal Consistency ───────────────────────────
         print("\n" + "─" * 50)
         print("  3. Temporal Consistency")
         print("─" * 50)
 
         t0 = time.time()
-        z_rls = encode_all_zrl(model, data[:N], device)
+        # Reuse z_rls already computed above
         temporal = eval_temporal(z_rls, episode_indices, N)
         all_results["temporal"] = temporal
 
@@ -455,7 +479,7 @@ def main():
         print(f"  Episodes: {temporal['num_episodes']}")
         print(f"  ({time.time()-t0:.1f}s)")
     else:
-        print("\n  [Temporal analysis skipped — provide --dataset_root to enable]")
+        print("\n  [Linear probe & temporal skipped — provide --dataset_root to enable]")
 
     # ── Save ──────────────────────────────────────────────────
     if args.output_dir:
