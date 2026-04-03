@@ -62,7 +62,8 @@ class RLTokenDecoder(nn.Module):
             [z_rl.unsqueeze(1), z_target[:, :-1, :]],
             dim=1,
         )
-        output = self.transformer(decoder_in, is_causal=True)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(M, device=decoder_in.device)
+        output = self.transformer(decoder_in, mask=causal_mask)
         pred = self.output_proj(output)
         return pred
 
