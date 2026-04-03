@@ -55,20 +55,6 @@ class RLTokenDecoder(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(decoder_layer, num_layers=num_layers)
         self.output_proj = nn.Linear(d_model, d_model)
-        self._causal_mask: torch.Tensor | None = None
-        self._causal_mask_device: torch.device | None = None
-
-    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        if (
-            self._causal_mask is None
-            or self._causal_mask.size(0) != seq_len
-            or self._causal_mask_device != device
-        ):
-            self._causal_mask = nn.Transformer.generate_square_subsequent_mask(
-                seq_len, device=device
-            )
-            self._causal_mask_device = device
-        return self._causal_mask
 
     def forward(self, z_rl: torch.Tensor, z_target: torch.Tensor) -> torch.Tensor:
         B, M, D = z_target.shape
@@ -76,8 +62,7 @@ class RLTokenDecoder(nn.Module):
             [z_rl.unsqueeze(1), z_target[:, :-1, :]],
             dim=1,
         )
-        causal_mask = self._get_causal_mask(M, decoder_in.device)
-        output = self.transformer(decoder_in, mask=causal_mask, is_causal=True)
+        output = self.transformer(decoder_in, is_causal=True)
         pred = self.output_proj(output)
         return pred
 
