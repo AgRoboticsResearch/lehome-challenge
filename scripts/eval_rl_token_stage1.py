@@ -441,6 +441,28 @@ def main():
         z_rls = encode_all_zrl(model, data[:N], device)
         print(f"  Done: {z_rls.shape} ({time.time()-t_enc:.1f}s)")
 
+        # z_rl scale statistics (norm stability for Stage 2)
+        zrl_norms = z_rls.norm(dim=-1)
+        cv = zrl_norms.std() / zrl_norms.mean()
+        per_dim_std = z_rls.std(dim=0)
+        print(f"\n  z_rl scale statistics:")
+        print(f"    L2 norm: mean={zrl_norms.mean():.2f}, std={zrl_norms.std():.2f}, "
+              f"min={zrl_norms.min():.2f}, max={zrl_norms.max():.2f}")
+        print(f"    CV (std/mean): {cv:.4f} "
+              f"{'(stable)' if cv < 0.3 else '(HIGH VARIANCE)'}")
+        print(f"    Per-dim std: [{per_dim_std.min():.4f}, {per_dim_std.max():.4f}] "
+              f"(ratio {per_dim_std.max() / per_dim_std.min():.1f}x)")
+        all_results["z_rl_scale"] = {
+            "norm_mean": zrl_norms.mean().item(),
+            "norm_std": zrl_norms.std().item(),
+            "norm_min": zrl_norms.min().item(),
+            "norm_max": zrl_norms.max().item(),
+            "cv": cv.item(),
+            "per_dim_std_min": per_dim_std.min().item(),
+            "per_dim_std_max": per_dim_std.max().item(),
+            "per_dim_std_ratio": (per_dim_std.max() / per_dim_std.min()).item(),
+        }
+
         # Compute mean pooling baseline
         z_target_means = compute_z_target_mean(data[:N], model.keep_mask.cpu())
 
