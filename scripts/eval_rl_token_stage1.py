@@ -212,6 +212,7 @@ def encode_all_zrl(model, data, device, batch_size=256):
 @torch.no_grad()
 def compute_z_target_mean(data, keep_mask, batch_size=256):
     """Mean-pooled z_target as baseline (same 960D as z_rl)."""
+    keep_mask = keep_mask.cpu()  # data is CPU (memmap), mask must match
     N = data.shape[0]
     means = []
     for i in tqdm(range(0, N, batch_size), desc="  Mean pooling", ncols=80):
@@ -441,7 +442,7 @@ def main():
         print(f"  Done: {z_rls.shape} ({time.time()-t_enc:.1f}s)")
 
         # Compute mean pooling baseline
-        z_target_means = compute_z_target_mean(data[:N], model.keep_mask)
+        z_target_means = compute_z_target_mean(data[:N], model.keep_mask.cpu())
 
         # ── 2. Linear Probe ───────────────────────────────────
         print("\n" + "─" * 50)
