@@ -492,7 +492,7 @@ def process_observation(obs_dict, vla_hook, stage1, normalizer, device):
 ```yaml
 # Stage 1 artifacts
 smolvla_pretrained_path: outputs/moe_train/.../pretrained_model
-rl_token_stage1_path: outputs/rl_token/stage1/checkpoints/best/rl_token_stage1.pt
+rl_token_stage1_path: outputs/rl_token/stage1/checkpoints/step_10000/rl_token_stage1.pt  # step 10K: best action info (MSE 0.0275, -5.5% vs state), best episode gap (0.74); step 45K overfits reconstruction at expense of task relevance
 task_description: "fold the garment"
 
 # Normalization (dataset stats only)
