@@ -21,6 +21,7 @@ Stage 1 (offline, already implemented) trains an RL Token Encoder/Decoder to com
 | Reference dropout | **50%** during training, always provided at eval | Paper Section IV-B |
 | Eval ã | **Full VLA at eval** | Paper-faithful, fast enough on GPU |
 | **Normalization** | **Dataset stats only** | joint_pos/action 用 dataset stats.json；z_rl 不归一化（已由 Stage 1 控制） |
+| **Actor 初始化** | **BC pretrain from warmup data** | 从 VLA 行为克隆开始，避免 random actor 产生垃圾数据 |
 
 ---
 
@@ -392,11 +393,47 @@ def train(cfg):
             z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
             action_chunk = a_tilde[:, :C, :]               # use VLA directly
             action_raw = normalizer.denormalize_action(action_chunk)
+            rewards = []
             for t in range(C):
                 obs, reward, done = env.step(action_raw[t].cpu().numpy())
-            next_z_rl, _, next_s_p = process_observation(...) if not done else zeros
-            replay.add(z_rl, s_p, a_tilde, action_chunk, chunk_return,
+                rewards.append(reward)
+                if done:
+                    break                                        # early term on episode end
+            n_exec = len(rewards)
+            chunk_return = sum(gamma**k * r for k, r in enumerate(rewards))
+            # handle partial chunk
+            action_stored = action_chunk.clone()
+            if n_exec < C:
+                action_stored[:, n_exec:] = 0                  # zero-pad phantom steps
+            next_z_rl, next_s_p = (zeros, zeros) if done else process_observation(obs, ...)
+            replay.add(z_rl, s_p, a_tilde, action_stored, chunk_return,
                        next_z_rl, next_s_p, done)
+
+    # Phase 4.5: BC Pretrain Actor (warm start from VLA behavior)
+    #   Goal: initialize actor to mimic VLA before RL begins
+    #   Uses warmup data already in replay buffer
+    bc_optim = Adam(actor.parameters(), lr=1e-3)
+    for epoch in range(bc_pretrain_epochs):
+        total_bc_loss = 0
+        n_batches = 0
+        for _ in range(bc_batches_per_epoch):
+            batch = replay.sample(batch_size)
+            # actor sees full ref (no dropout during BC pretrain)
+            a_pred = actor(batch["z_rl"], batch["s_p"], batch["ref_action"])
+            loss = F.mse_loss(a_pred, batch["ref_action"][:, :C, :].flatten(1))
+            bc_optim.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
+            bc_optim.step()
+            total_bc_loss += loss.item()
+            n_batches += 1
+        avg_loss = total_bc_loss / n_batches
+        print(f"  BC epoch {epoch}: loss={avg_loss:.6f}")
+        if avg_loss < bc_loss_threshold:
+            print(f"  BC converged at epoch {epoch}")
+            break
+    # Sync actor target with BC-pretrained weights
+    trainer.actor_target = copy.deepcopy(actor)
 
     # Phase 5: Online RL
     for ep in range(total_episodes):
@@ -480,6 +517,12 @@ update_to_data_ratio: 5
 # Replay buffer
 replay_capacity: 100000
 warmup_episodes: 20
+
+# BC pretrain (Phase 4.5: actor warm start)
+bc_pretrain_epochs: 100        # max epochs
+bc_batches_per_epoch: 100      # batches per epoch
+bc_lr: 1.0e-3                  # BC learning rate
+bc_loss_threshold: 0.01        # stop early if loss < this
 
 # Run
 total_episodes: 500
