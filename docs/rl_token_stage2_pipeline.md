@@ -273,7 +273,8 @@ class RLTTrainer:
     def __init__(self, actor, critic, device,
                  actor_lr=3e-4, critic_lr=3e-4,
                  gamma=0.99, tau=0.005, beta=0.1,
-                 actor_delay=2, grad_clip=1.0):
+                 chunk_size=10, actor_delay=2, grad_clip=1.0):
+        self.gamma_chunk = gamma ** chunk_size  # 0.99^10 ≈ 0.904
         self.actor = actor.to(device)
         self.critic = critic.to(device)
         self.actor_target = copy.deepcopy(actor)
@@ -283,7 +284,9 @@ class RLTTrainer:
 
     def update_critic(self, batch) -> metrics:
         """
-        target = r + γ * (1-d) * min(Q1_t, Q2_t)
+        # chunk_return already = Σ γ^t * r_t (discounted within chunk)
+        # next state is C steps away → use γ^C, not γ
+        target = r + γ^C * (1-d) * min(Q1_t, Q2_t)
         loss = MSE(Q1, target) + MSE(Q2, target)
         """
 
@@ -421,7 +424,7 @@ ref_dropout: 0.5
 # Training
 actor_lr: 3.0e-4
 critic_lr: 3.0e-4
-gamma: 0.99
+gamma: 0.99                 # per-step discount; trainer uses gamma^C = 0.99^10 ≈ 0.904 for chunk-level TD targets
 tau: 0.005
 beta: 0.1
 actor_delay: 2
