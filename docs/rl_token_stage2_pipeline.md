@@ -309,6 +309,7 @@ class RLTTrainer:
     """
     TD3+BC trainer:
     - Twin critics with clipped double-Q (TD3)
+    - Target policy smoothing: add clipped noise to target action (TD3 §4.3)
     - Delayed actor updates (every 2 critic steps)
     - BC regularization: L_π = -Q1(x,a) + β * ||a - ã||²
     - Reference action dropout (50%)
@@ -319,6 +320,7 @@ class RLTTrainer:
     def __init__(self, actor, critic, device,
                  actor_lr=3e-4, critic_lr=3e-4,
                  gamma=0.99, tau=0.005, beta=0.1,
+                 target_noise_std=0.2, noise_clip=0.5,
                  chunk_size=10, actor_delay=2, grad_clip=1.0):
         self.gamma_chunk = gamma ** chunk_size  # 0.99^10 ≈ 0.904
         self.actor = actor.to(device)
@@ -330,10 +332,16 @@ class RLTTrainer:
 
     def update_critic(self, batch) -> metrics:
         """
-        # chunk_return already = Σ γ^t * r_t (discounted within chunk)
-        # next state is C steps away → use γ^C, not γ
-        # partial chunk (n_exec < C): done=True → (1-d)=0 → target = chunk_return only
-        target = r + γ^C * (1-d) * min(Q1_t, Q2_t)
+        # --- TD3 Target Policy Smoothing (Section 4.3) ---
+        # 1. Get deterministic target action from target actor
+        next_a = actor_target(z_rl_next, s_p_next, ref_next)
+        # 2. Add clipped Gaussian noise (prevents Q overestimation at narrow peaks)
+        noise = (torch.randn_like(next_a) * target_noise_std).clamp(-noise_clip, noise_clip)
+        next_a_smooth = (next_a + noise).clamp(-1, 1)  # stay in normalized [-1,1] range
+        # 3. Clipped double-Q with smoothed target
+        target = chunk_return + γ^C * (1-d) * min(Q1_t(z_next, s_next, next_a_smooth),
+                                                   Q2_t(z_next, s_next, next_a_smooth))
+        # 4. Partial chunks: done=True → (1-d)=0 → target = chunk_return only
         loss = MSE(Q1, target) + MSE(Q2, target)
         """
 
@@ -511,6 +519,8 @@ gamma: 0.99                 # per-step discount; trainer uses gamma^C = 0.99^10 
 tau: 0.005
 beta: 0.1
 actor_delay: 2
+target_noise_std: 0.2          # TD3 target policy smoothing σ
+noise_clip: 0.5                # TD3 noise clip c
 grad_clip: 1.0
 update_to_data_ratio: 5
 
