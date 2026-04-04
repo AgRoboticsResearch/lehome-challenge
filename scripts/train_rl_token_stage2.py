@@ -433,17 +433,12 @@ def main():
 
     parser = argparse.ArgumentParser(description="Stage 2 RL Token Training")
     parser.add_argument("--config", type=str, required=True, help="YAML config path")
-    parser.add_argument("--device", type=str, default=None, help="Device override (cpu/cuda)")
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
 
     # Load config
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-
-    # Override device from CLI if provided
-    if args.device is not None:
-        cfg["device"] = args.device
 
     print("Config:")
     for k, v in cfg.items():
