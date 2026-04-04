@@ -146,6 +146,7 @@ def train(cfg: dict, simulation_app):
         pretrained_path=cfg["smolvla_pretrained_path"],
         device=str(device),
         task_description=cfg.get("task_description", "fold the garment"),
+        dataset_stats_path=cfg["dataset_stats_path"],
     )
 
     stage1 = RLTokenStage1()
@@ -248,8 +249,9 @@ def train(cfg: dict, simulation_app):
 
     warmup_start = time.time()
     for ep in range(cfg["warmup_episodes"]):
-        obs, info = env.reset()
+        env.reset()
         stabilize_garment_after_reset(env, args_namespace)
+        obs = env._get_observations()
 
         z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
         episode_reward = 0
@@ -295,7 +297,12 @@ def train(cfg: dict, simulation_app):
             obs = env._get_observations()
             z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
 
-        print(f"  Ep {ep+1}/{cfg['warmup_episodes']}: reward={episode_reward:.3f}, buffer={len(replay)}")
+        success = env._get_success()
+        is_success = success.item() if torch.is_tensor(success) else bool(success)
+        avg_reward = episode_reward / max(episode_steps, 1)
+        print(f"  Ep {ep+1}/{cfg['warmup_episodes']}: reward={episode_reward:.3f}, "
+              f"steps={episode_steps}, avg_r/step={avg_reward:.4f}, "
+              f"buffer={len(replay)}, Success={is_success}")
 
     warmup_time = time.time() - warmup_start
     print(f"  Warmup done: {len(replay)} transitions in {warmup_time:.1f}s")
@@ -344,8 +351,9 @@ def train(cfg: dict, simulation_app):
     best_reward = -float("inf")
 
     for ep in range(cfg["total_episodes"]):
-        obs, info = env.reset()
+        env.reset()
         stabilize_garment_after_reset(env, args_namespace)
+        obs = env._get_observations()
 
         z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
         episode_reward = 0
@@ -404,9 +412,14 @@ def train(cfg: dict, simulation_app):
             obs = env._get_observations()
             z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
 
+        success = env._get_success()
+        is_success = success.item() if torch.is_tensor(success) else bool(success)
+        avg_reward = episode_reward / max(episode_steps, 1)
         avg_metrics = {k: sum(v) / len(v) for k, v in episode_metrics.items() if v}
-        print(f"  Ep {ep+1}: reward={episode_reward:.3f}, buffer={len(replay)}, "
-              + ", ".join(f"{k}={v:.4f}" for k, v in avg_metrics.items()))
+        metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in avg_metrics.items())
+        print(f"  Ep {ep+1}: reward={episode_reward:.3f}, steps={episode_steps}, "
+              f"avg_r/step={avg_reward:.4f}, buffer={len(replay)}, Success={is_success}"
+              + (f", {metrics_str}" if metrics_str else ""))
 
         if (ep + 1) % cfg["save_freq"] == 0:
             ckpt_path = output_dir / f"episode_{ep+1}.pt"
