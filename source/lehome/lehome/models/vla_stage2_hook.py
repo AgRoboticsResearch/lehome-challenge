@@ -1,3 +1,5 @@
+import json
+
 import torch
 
 from lehome.models.vla_prefix_hook import VLAPrefixHook
@@ -13,6 +15,10 @@ class VLAStage2Hook:
     then runs ODE denoising with the cached KV — avoiding the duplicate prefix encoding that
     separate VLAPrefixHook.extract_prefix() + sample_actions() would require.
 
+    CRITICAL: Normalizes observation.state using dataset stats before feeding to the model,
+    matching the eval pipeline's expert preprocessor behavior. Without this, the VLA receives
+    raw joint positions instead of the normalized values it was trained on.
+
     Saves ~30-80ms per decision chunk.
     """
 
@@ -23,6 +29,7 @@ class VLAStage2Hook:
         task_description: str = "fold the garment",
         image_keys: list[str] | None = None,
         state_dim: int = 12,
+        dataset_stats_path: str | None = None,
     ):
         self.prefix_hook = VLAPrefixHook(
             pretrained_path=pretrained_path,
@@ -34,6 +41,25 @@ class VLAStage2Hook:
         self.model = self.prefix_hook.model  # VLAFlowMatching, already frozen
         self.device = self.prefix_hook.device
 
+        # Load state normalization stats (same as eval pipeline's expert preprocessor)
+        self.state_mean = None
+        self.state_std = None
+        if dataset_stats_path:
+            with open(dataset_stats_path) as f:
+                stats = json.load(f)
+            self.state_mean = torch.tensor(
+                stats["observation.state"]["mean"], device=device
+            )
+            self.state_std = torch.tensor(
+                stats["observation.state"]["std"], device=device
+            )
+
+    def _normalize_state(self, state: torch.Tensor) -> torch.Tensor:
+        """Normalize state: (x - mean) / std, matching eval preprocessor."""
+        if self.state_mean is not None:
+            return (state - self.state_mean) / self.state_std
+        return state
+
     @torch.no_grad()
     def forward(
         self,
@@ -44,15 +70,24 @@ class VLAStage2Hook:
 
         Args:
             obs_dict: Dict with image keys (observation.images.*_rgb) and
-                      "observation.state" (joint positions).
+                      "observation.state" (joint positions, RAW or normalized).
 
         Returns:
             z_vlm:   (B, prefix_len, hidden_size) — VLM prefix hidden states for RL Token Encoder.
-            a_tilde: (B, chunk_size, action_dim)  — VLA reference action chunk (unpadded).
+            a_tilde: (B, chunk_size, action_dim)  — VLA reference action chunk (normalized space).
         """
         # ── Phase 1: Prepare + embed prefix (same as VLAPrefixHook.extract_prefix) ──
         images, img_masks = self.prefix_hook.prepare_images(obs_dict)
-        state = self.prefix_hook.prepare_state(obs_dict["observation.state"])
+
+        # Normalize state before feeding to model (CRITICAL: model was trained on normalized state)
+        raw_state = obs_dict["observation.state"]
+        if isinstance(raw_state, torch.Tensor):
+            raw_state = raw_state.float().to(self.device)
+        else:
+            raw_state = torch.as_tensor(raw_state, dtype=torch.float32, device=self.device)
+        state = self._normalize_state(raw_state)
+        state = self.prefix_hook.prepare_state(state)
+
         B = state.shape[0]
         lang_tokens = self.prefix_hook._lang_tokens.expand(B, -1).to(self.device)
         lang_masks = self.prefix_hook._lang_masks.expand(B, -1).to(self.device)
