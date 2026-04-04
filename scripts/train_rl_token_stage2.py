@@ -20,13 +20,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-import gymnasium as gym
-
-from isaaclab_tasks.utils import parse_env_cfg
-
-from scripts.utils.common import stabilize_garment_after_reset
 
 from lehome.models.rl_stage2 import (
     RLActor,
@@ -129,7 +125,11 @@ def compute_chunk_return(rewards: list[float], gamma: float) -> float:
 # ═══════════════════════════════════════════════════════════════════
 
 
-def train(cfg: dict):
+def train(cfg: dict, simulation_app):
+    import gymnasium as gym
+    from isaaclab_tasks.utils import parse_env_cfg
+    from scripts.utils.common import stabilize_garment_after_reset
+
     device = torch.device(cfg["device"])
     env_device = cfg.get("env_device", "cpu")
     chunk_size = cfg["chunk_size"]
@@ -425,19 +425,46 @@ def train(cfg: dict):
 
 
 def main():
+    import multiprocessing
+    if multiprocessing.get_start_method() != "spawn":
+        multiprocessing.set_start_method("spawn", force=True)
+
+    from isaaclab.app import AppLauncher
+
     parser = argparse.ArgumentParser(description="Stage 2 RL Token Training")
     parser.add_argument("--config", type=str, required=True, help="YAML config path")
+    parser.add_argument("--headless", action="store_true", help="Run headless (no GUI)")
+    parser.add_argument("--device", type=str, default=None, help="Device override (cpu/cuda)")
+    AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
 
+    # Load config
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    # Override device from CLI if provided
+    if args.device is not None:
+        cfg["device"] = args.device
 
     print("Config:")
     for k, v in cfg.items():
         print(f"  {k}: {v}")
     print()
 
-    train(cfg)
+    # Launch Isaac Sim
+    app_launcher = AppLauncher(args)
+    simulation_app = app_launcher.app
+
+    try:
+        import lehome.tasks.bedroom  # noqa: F401 — register tasks
+
+        train(cfg, simulation_app)
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        simulation_app.close()
 
 
 if __name__ == "__main__":
