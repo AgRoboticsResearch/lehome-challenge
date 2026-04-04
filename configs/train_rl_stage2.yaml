@@ -48,7 +48,7 @@ bc_lr: 1.0e-3
 bc_loss_threshold: 0.01
 
 # ── Run ──
-max_episode_steps: 300          # max sim steps per episode (~10s at 30Hz)
+max_episode_steps: 600          # VLA needs ~336 steps to succeed, give enough room
 total_episodes: 500
 batch_size: 256
 output_dir: outputs/rl_token/stage2
