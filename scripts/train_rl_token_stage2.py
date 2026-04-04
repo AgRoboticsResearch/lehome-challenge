@@ -359,7 +359,7 @@ def train(cfg: dict, simulation_app):
             action_norm = actor(z_rl, s_p, a_tilde[:, :chunk_size, :])
             action_raw = normalizer.denormalize_action(
                 action_norm.view(1, chunk_size, cfg["action_dim"])
-            ).squeeze(0).cpu().numpy()
+            ).squeeze(0).detach().cpu().numpy()
 
             rewards, done, last_obs = execute_chunk(env, action_raw, chunk_size, gamma)
             n_exec = len(rewards)
