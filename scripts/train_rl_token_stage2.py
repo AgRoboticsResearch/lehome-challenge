@@ -225,8 +225,8 @@ def train(cfg: dict, simulation_app):
         "device": env_device,
         "seed": cfg.get("seed", 42),
     "use_random_seed": False,
-        "garment_cfg_base_path": cfg.get("garment_cfg_base_path", "Assets/objects/Challenge_Garment/Release/"),
-        "particle_cfg_path": cfg.get("particle_cfg_path", "Assets/objects/Challenge_Garment/particle_config/"),
+        "garment_cfg_base_path": cfg.get("garment_cfg_base_path", "Assets/objects/Challenge_Garment"),
+        "particle_cfg_path": cfg.get("particle_cfg_path", "source/lehome/lehome/tasks/bedroom/config_file/particle_garment_cfg.yaml"),
         "teleop_device": "keyboard",
     })
     env_cfg = parse_env_cfg(args_namespace.task, device=env_device)

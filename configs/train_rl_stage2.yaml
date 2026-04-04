@@ -10,8 +10,8 @@ task_description: "fold the garment"
 task: LeHome-BiSO101-Direct-Garment-v2
 garment_name: Top_Long_Unseen_0
 garment_version: Release
-garment_cfg_base_path: Assets/objects/Challenge_Garment/Release/
-particle_cfg_path: Assets/objects/Challenge_Garment/particle_config/
+garment_cfg_base_path: Assets/objects/Challenge_Garment
+particle_cfg_path: source/lehome/lehome/tasks/bedroom/config_file/particle_garment_cfg.yaml
 
 # ── Architecture ──
 chunk_size: 10
