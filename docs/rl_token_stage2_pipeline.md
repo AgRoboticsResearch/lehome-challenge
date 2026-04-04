@@ -41,7 +41,7 @@ Every C=10 steps:
    obs = env._get_observations()   # CPU numpy dicts
    obs_gpu = {k: torch.as_tensor(v).to(device) for k,v in obs.items()}
 
-2. VLA UNIFIED FORWARD on GPU (frozen, ~65-145ms, shared KV cache)
+2. VLA UNIFIED FORWARD on GPU (frozen, ~110ms, shared KV cache)
    z_vlm, a_tilde = vla_hook.forward(obs_gpu)
                      ↑ z_vlm: (1, 196, 960)    ← VLM hidden states
                      ↑ a_tilde: (1, 50, 12)    ← ODE denoised actions
@@ -236,12 +236,13 @@ class VLAStage2Hook:
         return z_vlm, a_tilde
 ```
 
-### 性能对比
+### 性能对比（实测，GPU warmup 后 5 次平均）
 
 | 方案 | VLM Forward 次数 | 每chunk耗时 | 500 episodes |
 |---|---|---|---|
-| 分开调用（VLAPrefixHook + LeRobotPolicy） | 2 次 | ~160ms | ~7.2 小时 |
-| **统一 Hook（VLAStage2Hook）** | **1 次** | **~100ms** | **~1.7-3.6 小时** |
+| 分开调用（VLAPrefixHook + sample_actions） | 2 次 | ~147ms | ~7.4 小时 |
+| **统一 Hook（VLAStage2Hook）** | **1 次** | **~110ms** | **~5.5 小时** |
+| 节省 | 1 次 prefix | **~37ms (25%)** | **~1.9 小时** |
 | 节省 | 50% | ~37% | **~3.6 小时** |
 
 ---
