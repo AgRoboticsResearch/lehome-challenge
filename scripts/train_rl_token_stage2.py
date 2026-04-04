@@ -22,6 +22,34 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
+import gymnasium as gym
+
+from isaaclab_tasks.utils import parse_env_cfg
+
+from scripts.utils.common import stabilize_garment_after_reset
+
+from lehome.models.rl_stage2 import (
+    RLActor,
+    TwinCritic,
+    RLTTrainer,
+    ReplayBuffer,
+    SimpleNormalizer,
+)
+from lehome.models.rl_token import RLTokenStage1
+from lehome.models.vla_stage2_hook import VLAStage2Hook
+
+
+import yaml
+
+
+import os
+
+
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+
+os.environ.setdefault("TOKENIZERS_PARALLEL", "1")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -33,12 +61,11 @@ def prepare_obs_batch(obs: dict, device: torch.device) -> dict[str, torch.Tensor
     """Convert env._get_observations() output to VLAStage2Hook format.
 
     env output:
-        observation.images.top_rgb:  (H, W, 4) uint8 RGBA numpy  ← Isaac Sim "rgb" = 4ch
-        observation.state:           (12,)     float32 numpy
-
+        observation.images.*_rgb: (H, W, 4) uint8 RGBA numpy  ← Isaac Sim "rgb" = 4ch
+        observation.state:         (12,)     float32 numpy
     hook expects:
-        observation.images.top_rgb:  (1, C, H, W) float32 tensor [0, 1]
-        observation.state:           (1, 12)     float32 tensor
+        observation.images.*_rgb: (1, C, H, W) float32 tensor [0, 1]
+        observation.state:         (1, 12)     float32 tensor
     """
     batch = {}
     for key, value in obs.items():
@@ -57,11 +84,11 @@ def prepare_obs_batch(obs: dict, device: torch.device) -> dict[str, torch.Tensor
 
 @torch.no_grad()
 def process_observation(obs_dict, vla_hook, stage1, normalizer, device):
-    """Full observation pipeline: env obs → (z_rl, a_tilde, s_p).
+    """Full pipeline: env obs → (z_rl, a_tilde, s_p).
 
     Returns:
         z_rl:    (1, 960) — RL Token state
-        a_tilde: (1, 50, 12) — VLA reference action chunk (normalized space)
+        a_tilde: (1, 50, 12) — VLA reference action chunk (normalized)
         s_p:     (1, 12) — normalized joint positions
     """
     batch = prepare_obs_batch(obs_dict, device)
@@ -78,41 +105,22 @@ def process_observation(obs_dict, vla_hook, stage1, normalizer, device):
     return z_rl, a_tilde, s_p
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Chunk execution helpers
-# ═══════════════════════════════════════════════════════════════════
-
-
 def execute_chunk(env, action_raw: np.ndarray, max_steps: int, gamma: float):
-    """Execute action chunk open-loop, return rewards and done flag.
-
-    Args:
-        env: Isaac Sim environment
-        action_raw: (C, 12) numpy array in raw joint space
-        max_steps: chunk size C
-        gamma: per-step discount factor
-
-    Returns:
-        rewards: list of per-step rewards
-        done: whether episode ended
-        last_obs: final observation dict
-    """
+    """Execute action chunk open-loop on return rewards and done flag."""
     rewards = []
-    last_obs = None
     done = False
     for t in range(max_steps):
         action_tensor = torch.from_numpy(action_raw[t]).float().unsqueeze(0)
         obs, reward, terminated, truncated, info = env.step(action_tensor)
         done = terminated.item() if torch.is_tensor(terminated) else bool(terminated)
-        rewards.append(reward if not torch.is_tensor(reward) else reward.item())
-        last_obs = obs
+        r = reward.item() if torch.is_tensor(reward) else float(reward)
+        rewards.append(r)
         if done:
             break
-    return rewards, done, last_obs
+    return rewards, done, obs
 
 
-def compute_chunk_return(rewards: list[float], gamma: float) -> float:
-    """Compute discounted chunk return: Σ γ^t * r_t."""
+def compute_chunk_return(rewards, list[float], gamma: float) -> float:
     return sum(gamma ** t * r for t, r in enumerate(rewards))
 
 
@@ -122,39 +130,23 @@ def compute_chunk_return(rewards: list[float], gamma: float) -> float:
 
 
 def train(cfg: dict):
-    from isaaclab_tasks.utils import parse_env_cfg
-    import gymnasium as gym
-
-    from lehome.models.rl_stage2 import (
-        RLActor,
-        TwinCritic,
-        RLTTrainer,
-        ReplayBuffer,
-        SimpleNormalizer,
-    )
-    from lehome.models.rl_token import RLTokenStage1
-    from lehome.models.vla_stage2_hook import VLAStage2Hook
-    from scripts.utils.common import stabilize_garment_after_reset
-
     device = torch.device(cfg["device"])
     env_device = cfg.get("env_device", "cpu")
     chunk_size = cfg["chunk_size"]
     gamma = cfg["gamma"]
 
-    # ── Phase 1: Load frozen components ──
+    # ── Phase 1: Load frozen Components ──
     print("=" * 60)
-    print("Phase 1: Loading frozen components")
+    print("Phase 1: Loading Frozen Components")
     print("=" * 60)
 
     normalizer = SimpleNormalizer(cfg["dataset_stats_path"], device)
-    print(f"  Normalizer loaded from {cfg['dataset_stats_path']}")
 
     vla_hook = VLAStage2Hook(
         pretrained_path=cfg["smolvla_pretrained_path"],
         device=str(device),
         task_description=cfg.get("task_description", "fold the garment"),
     )
-    print(f"  VLAStage2Hook loaded on {device}")
 
     stage1 = RLTokenStage1()
     state_dict = torch.load(cfg["rl_token_stage1_path"], map_location=device, weights_only=True)
@@ -163,11 +155,14 @@ def train(cfg: dict):
     for p in stage1.parameters():
         p.requires_grad = False
     stage1.to(device)
-    print(f"  Stage 1 loaded from {cfg['rl_token_stage1_path']}")
 
-    # ── Phase 2: Create trainable components ──
+    print(f"  Normalizer: {cfg['dataset_stats_path']}")
+    print(f"  VLA hook: {cfg['smolvla_pretrained_path']}")
+    print(f"  Stage 1: {cfg['rl_token_stage1_path']}")
+
+    # ── Phase 2: Create Trainable Components ──
     print("\n" + "=" * 60)
-    print("Phase 2: Creating trainable components")
+    print("Phase 2: Creating Trainable Components")
     print("=" * 60)
 
     actor = RLActor(
@@ -208,27 +203,28 @@ def train(cfg: dict):
         gamma=gamma,
         tau=cfg["tau"],
         beta=cfg["beta"],
+        target_noise_std=cfg.get("target_noise_std", 0.2),
+        noise_clip=cfg.get("noise_clip", 0.5),
         chunk_size=chunk_size,
         actor_delay=cfg["actor_delay"],
         grad_clip=cfg["grad_clip"],
     )
 
     total_params = sum(p.numel() for p in actor.parameters()) + sum(p.numel() for p in critic.parameters())
-    print(f"  Actor params: {sum(p.numel() for p in actor.parameters()):,}")
-    print(f"  Critic params: {sum(p.numel() for p in critic.parameters()):,}")
-    print(f"  Total trainable: {total_params:,}")
-    print(f"  ReplayBuffer capacity: {cfg['replay_capacity']:,}")
+    print(f"  Actor: {sum(p.numel() for p in actor.parameters()):,} params")
+    print(f"  Critic: {sum(p.numel() for p in critic.parameters()):,} params")
+    print(f"  ReplayBuffer: {cfg['replay_capacity']:,} capacity")
 
-    # ── Phase 3: Create environment ──
+    # ── Phase 3: Create Environment ──
     print("\n" + "=" * 60)
-    print("Phase 3: Creating Isaac Sim environment")
+    print("Phase 3: Creating Isaac Sim Environment")
     print("=" * 60)
 
     args_namespace = argparse.Namespace(**{
         "task": cfg.get("task", "LeHome-BiSO101-Direct-Garment-v2"),
         "device": env_device,
         "seed": cfg.get("seed", 42),
-        "use_random_seed": False,
+    "use_random_seed": False,
         "garment_cfg_base_path": cfg.get("garment_cfg_base_path", "Assets/objects/Challenge_Garment/Release/"),
         "particle_cfg_path": cfg.get("particle_cfg_path", "Assets/objects/Challenge_Garment/particle_config/"),
         "teleop_device": "keyboard",
@@ -243,9 +239,9 @@ def train(cfg: dict):
 
     env = gym.make(args_namespace.task, cfg=env_cfg).unwrapped
     env.initialize_obs()
-    print(f"  Env created: {args_namespace.task}, garment={cfg['garment_name']}")
+    print(f"  Env: {args_namespace.task}, garment={cfg['garment_name']}")
 
-    # ── Phase 4: Warmup — fill replay buffer with VLA actions ──
+    # ── Phase 4: Warmup ──
     print("\n" + "=" * 60)
     print(f"Phase 4: Warmup ({cfg['warmup_episodes']} episodes)")
     print("=" * 60)
@@ -259,16 +255,15 @@ def train(cfg: dict):
         episode_reward = 0
 
         while True:
-            # Use VLA actions directly (no actor)
+            # Use VLA actions directly
             action_chunk_norm = a_tilde[:, :chunk_size, :]
-            action_raw = normalizer.denormalize_action(action_chunk_norm).squeeze(0).cpu().numpy()
+            action_raw_np = normalizer.denormalize_action(action_chunk_norm).squeeze(0).cpu().numpy()
 
-            rewards, done, last_obs = execute_chunk(env, action_raw, chunk_size, gamma)
+            rewards, done, last_obs = execute_chunk(env, action_raw_np, chunk_size, gamma)
             n_exec = len(rewards)
             chunk_return = compute_chunk_return(rewards, gamma)
             episode_reward += sum(rewards)
 
-            # Store transition
             action_stored = action_chunk_norm.clone()
             if n_exec < chunk_size:
                 action_stored[:, n_exec:] = 0
@@ -283,25 +278,21 @@ def train(cfg: dict):
                 )
 
             replay.add(
-                z_rl=z_rl,
-                s_p=s_p,
+                z_rl=z_rl, s_p=s_p,
                 ref_action=a_tilde[:, :chunk_size, :],
                 action=action_stored,
                 reward=chunk_return,
-                next_z_rl=next_z_rl,
-                next_s_p=next_s_p,
+                next_z_rl=next_z_rl, next_s_p=next_s_p,
                 done=done,
             )
 
             if done:
                 break
 
-            # Prepare next iteration
             obs = env._get_observations()
             z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
 
-        print(f"  Episode {ep+1}/{cfg['warmup_episodes']}: "
-              f"reward={episode_reward:.3f}, buffer={len(replay)}")
+        print(f"  Ep {ep+1}/{cfg['warmup_episodes']}: reward={episode_reward:.3f}, buffer={len(replay)}")
 
     warmup_time = time.time() - warmup_start
     print(f"  Warmup done: {len(replay)} transitions in {warmup_time:.1f}s")
@@ -319,7 +310,7 @@ def train(cfg: dict):
         n_batches = 0
         for _ in range(cfg["bc_batches_per_epoch"]):
             batch = replay.sample(cfg["batch_size"])
-            # Actor sees full ref (no dropout during BC pretrain)
+            # Full ref, no dropout during BC pretrain
             a_pred = actor(batch["z_rl"], batch["s_p"], batch["ref_action"])
             loss = F.mse_loss(a_pred, batch["ref_action"].flatten(1))
 
@@ -332,18 +323,17 @@ def train(cfg: dict):
             n_batches += 1
 
         avg_loss = total_loss / n_batches
-        print(f"  BC epoch {epoch+1}/{cfg['bc_pretrain_epochs']}: loss={avg_loss:.6f}")
+        print(f"  BC epoch {epoch+1}/{cfg['bc_pretrain_epochs']}: loss = {avg_loss:.6f}")
         if avg_loss < cfg["bc_loss_threshold"]:
             print(f"  BC converged at epoch {epoch+1}")
             break
 
-    # Sync target networks with BC-pretrained actor
     trainer.sync_actor_target()
     print("  Actor target synced with BC-pretrained weights")
 
     # ── Phase 5: Online RL ──
     print("\n" + "=" * 60)
-    print(f"Phase 5: Online RL — TD3+BC ({cfg['total_episodes']} episodes)")
+    print(f"Phase 5: Online RL ({cfg['total_episodes']} episodes)")
     print("=" * 60)
 
     output_dir = Path(cfg["output_dir"])
@@ -359,7 +349,7 @@ def train(cfg: dict):
         episode_metrics = {"critic_loss": [], "actor_loss": [], "bc_loss": []}
 
         while True:
-            # Actor forward (with ref dropout)
+            # Actor forward with ref dropout
             actor.train()
             action_norm = actor(z_rl, s_p, a_tilde[:, :chunk_size, :])
             action_raw = normalizer.denormalize_action(
@@ -408,13 +398,10 @@ def train(cfg: dict):
             obs = env._get_observations()
             z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
 
-        # Episode summary
         avg_metrics = {k: sum(v) / len(v) for k, v in episode_metrics.items() if v}
-        print(f"  Episode {ep+1}: reward={episode_reward:.3f}, "
-              f"buffer={len(replay)}, "
+        print(f"  Ep {ep+1}: reward={episode_reward:.3f}, buffer={len(replay)}, "
               + ", ".join(f"{k}={v:.4f}" for k, v in avg_metrics.items()))
 
-        # Checkpoint
         if (ep + 1) % cfg["save_freq"] == 0:
             ckpt_path = output_dir / f"episode_{ep+1}.pt"
             torch.save({
@@ -423,23 +410,18 @@ def train(cfg: dict):
                 "episode": ep + 1,
                 "episode_reward": episode_reward,
             }, ckpt_path)
-            print(f"  Saved checkpoint: {ckpt_path}")
+            print(f"  Checkpoint: {ckpt_path}")
 
             if episode_reward > best_reward:
                 best_reward = episode_reward
                 best_path = output_dir / "best_actor.pt"
                 torch.save(actor.state_dict(), best_path)
-                print(f"  New best reward: {best_reward:.3f}")
+                print(f"  New best: {best_reward:.3f}")
 
     print("\n" + "=" * 60)
     print(f"Training complete. Best reward: {best_reward:.3f}")
-    print(f"Checkpoints saved to: {output_dir}")
+    print(f"Checkpoints: {output_dir}")
     print("=" * 60)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Entry point
-# ═══════════════════════════════════════════════════════════════════
 
 
 def main():
@@ -447,7 +429,6 @@ def main():
     parser.add_argument("--config", type=str, required=True, help="YAML config path")
     args = parser.parse_args()
 
-    import yaml
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
@@ -461,3 +442,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
