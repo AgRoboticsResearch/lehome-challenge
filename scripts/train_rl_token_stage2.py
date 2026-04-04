@@ -110,7 +110,9 @@ def execute_chunk(env, action_raw: np.ndarray, max_steps: int, gamma: float):
         action_tensor = torch.from_numpy(action_raw[t]).float().unsqueeze(0)
         obs, reward, terminated, truncated, info = env.step(action_tensor)
         done = terminated.item() if torch.is_tensor(terminated) else bool(terminated)
-        r = reward.item() if torch.is_tensor(reward) else float(reward)
+        # Use _get_rewards() like eval does — env.step() may return stale/zero reward
+        reward_value = env._get_rewards()
+        r = reward_value.item() if torch.is_tensor(reward_value) else float(reward_value)
         rewards.append(r)
         if done:
             break
