@@ -115,31 +115,48 @@ def test_level2(pretrained_path: str, device: str = "cuda"):
     print(f"  VLAStage2Hook.device = {hook.device}")
     print(f"  VLAPrefixHook.device = {legacy.device}")
 
-    # 2b. Create dummy batch
+    # 2b. Create dummy batch + warmup
     batch = create_dummy_batch(batch_size=1, device="cpu")
 
-    # 2c. Run VLAStage2Hook (single pass)
-    print("\n[2b] Running VLAStage2Hook.forward()...")
-    t0 = time.time()
-    z_vlm_new, a_tilde_new = hook.forward(batch)
-    elapsed_new = time.time() - t0
+    print("\n[2b] CUDA warmup (1 iteration each)...")
+    _ = hook.forward(batch)
+    _ = legacy.extract_prefix(batch)
+    torch.cuda.synchronize()
+    print("  Warmup done")
+
+    # 2c. Benchmark VLAStage2Hook (N iterations)
+    N_BENCH = 5
+    print(f"\n[2c] Benchmarking VLAStage2Hook ({N_BENCH} iterations)...")
+    hook_times = []
+    for i in range(N_BENCH):
+        torch.cuda.synchronize()
+        t0 = time.time()
+        z_vlm_new, a_tilde_new = hook.forward(batch)
+        torch.cuda.synchronize()
+        hook_times.append(time.time() - t0)
+    elapsed_hook = sum(hook_times) / N_BENCH
     print(f"  z_vlm shape: {z_vlm_new.shape}")
     print(f"  a_tilde shape: {a_tilde_new.shape}")
     print(f"  z_vlm norm: {z_vlm_new.norm().item():.2f}")
     print(f"  a_tilde norm: {a_tilde_new.norm().item():.2f}")
-    print(f"  Elapsed: {elapsed_new * 1000:.0f}ms")
+    print(f"  Per-iter: {elapsed_hook * 1000:.0f}ms (min={min(hook_times)*1000:.0f}, max={max(hook_times)*1000:.0f})")
 
-    # 2d. Run VLAPrefixHook (separate pass for z_vlm)
-    print("\n[2c] Running VLAPrefixHook.extract_prefix()...")
-    t0 = time.time()
-    z_vlm_legacy = legacy.extract_prefix(batch)
-    elapsed_legacy_prefix = time.time() - t0
+    # 2d. Benchmark VLAPrefixHook (N iterations)
+    print(f"\n[2d] Benchmarking VLAPrefixHook.extract_prefix ({N_BENCH} iterations)...")
+    prefix_times = []
+    for i in range(N_BENCH):
+        torch.cuda.synchronize()
+        t0 = time.time()
+        z_vlm_legacy = legacy.extract_prefix(batch)
+        torch.cuda.synchronize()
+        prefix_times.append(time.time() - t0)
+    elapsed_prefix = sum(prefix_times) / N_BENCH
     print(f"  z_vlm shape: {z_vlm_legacy.shape}")
     print(f"  z_vlm norm: {z_vlm_legacy.norm().item():.2f}")
-    print(f"  Elapsed: {elapsed_legacy_prefix * 1000:.0f}ms")
+    print(f"  Per-iter: {elapsed_prefix * 1000:.0f}ms (min={min(prefix_times)*1000:.0f}, max={max(prefix_times)*1000:.0f})")
 
     # 2e. Compare z_vlm
-    print("\n[2d] Comparing z_vlm outputs...")
+    print("\n[2e] Comparing z_vlm outputs...")
     z_close = torch.allclose(z_vlm_new, z_vlm_legacy, atol=1e-4)
     z_max_diff = (z_vlm_new - z_vlm_legacy).abs().max().item()
     print(f"  allclose(atol=1e-4): {z_close}")
@@ -150,9 +167,7 @@ def test_level2(pretrained_path: str, device: str = "cuda"):
             print("  FAIL: diff too large!")
             return False
 
-    # 2f. Run sample_actions for action equivalence (optional, slow)
-    print("\n[2e] Running sample_actions for action comparison...")
-    t0 = time.time()
+    # 2f. Benchmark sample_actions (N iterations)
     images, img_masks = legacy.prepare_images(batch)
     state = legacy.prepare_state(batch["observation.state"])
     B = state.shape[0]
@@ -162,30 +177,32 @@ def test_level2(pretrained_path: str, device: str = "cuda"):
     img_masks_dev = [m.to(device) for m in img_masks]
     state_dev = state.to(device)
 
-    # Use same noise for fair comparison
-    noise = hook.model.sample_noise((B, 50, 32), torch.device(device))
-    noise_copy = noise.clone()
-
-    a_tilde_legacy = legacy.model.sample_actions(
-        images_dev, img_masks_dev, lang_tokens, lang_masks, state_dev, noise=noise_copy
-    )
-    elapsed_legacy_full = time.time() - t0
+    print(f"\n[2f] Benchmarking sample_actions ({N_BENCH} iterations)...")
+    sample_times = []
+    for i in range(N_BENCH):
+        torch.cuda.synchronize()
+        t0 = time.time()
+        a_tilde_legacy = legacy.model.sample_actions(
+            images_dev, img_masks_dev, lang_tokens, lang_masks, state_dev
+        )
+        torch.cuda.synchronize()
+        sample_times.append(time.time() - t0)
+    elapsed_sample = sum(sample_times) / N_BENCH
     a_tilde_legacy = a_tilde_legacy[:, :, :12]
     print(f"  a_tilde shape: {a_tilde_legacy.shape}")
-    print(f"  Elapsed: {elapsed_legacy_full * 1000:.0f}ms")
+    print(f"  Per-iter: {elapsed_sample * 1000:.0f}ms (min={min(sample_times)*1000:.0f}, max={max(sample_times)*1000:.0f})")
 
-    # Re-run hook with same noise
-    # (hook.forward already ran with different noise, so we need a manual comparison)
-    # Instead, let's just report the timing comparison
-    print(f"\n[2f] Timing comparison:")
-    print(f"  VLAStage2Hook (single pass):     {elapsed_new * 1000:.0f}ms")
-    print(f"  VLAPrefixHook (prefix only):      {elapsed_legacy_prefix * 1000:.0f}ms")
-    print(f"  sample_actions (full pipeline):    {elapsed_legacy_full * 1000:.0f}ms")
-    print(f"  Estimated two-pass total:          {(elapsed_legacy_prefix + elapsed_legacy_full) * 1000:.0f}ms")
-    savings = (1 - elapsed_new / (elapsed_legacy_prefix + elapsed_legacy_full)) * 100
-    print(f"  Savings: ~{savings:.0f}%")
+    # 2g. Timing summary
+    two_pass_total = elapsed_prefix + elapsed_sample
+    savings = (1 - elapsed_hook / two_pass_total) * 100
+    print(f"\n[2g] Timing comparison (avg of {N_BENCH}):")
+    print(f"  VLAStage2Hook (single pass):     {elapsed_hook * 1000:>7.0f}ms")
+    print(f"  VLAPrefixHook (prefix only):      {elapsed_prefix * 1000:>7.0f}ms")
+    print(f"  sample_actions (full pipeline):    {elapsed_sample * 1000:>7.0f}ms")
+    print(f"  Two-pass total (prefix+sample):    {two_pass_total * 1000:>7.0f}ms")
+    print(f"  Savings: {savings:+.0f}%")
 
-    # 2g. Shape checks
+    # 2h. Shape checks
     print("\n[2g] Shape checks...")
     assert z_vlm_new.ndim == 3, f"z_vlm should be 3D, got {z_vlm_new.ndim}D"
     assert z_vlm_new.shape[0] == 1, f"batch should be 1, got {z_vlm_new.shape[0]}"
