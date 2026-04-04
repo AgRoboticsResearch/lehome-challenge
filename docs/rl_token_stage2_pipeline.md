@@ -37,9 +37,19 @@ Device split:
 
 Every C=10 steps:
 
-1. OBSERVE (CPU → GPU transfer)
+1. OBSERVE (CPU → GPU transfer + 格式转换)
    obs = env._get_observations()   # CPU numpy dicts
-   obs_gpu = {k: torch.as_tensor(v).to(device) for k,v in obs.items()}
+   obs_gpu = prepare_obs_batch(obs, device)  # numpy RGBA → tensor RGB, see below
+
+   # env 输出格式:
+   #   observation.images.top_rgb:  (H, W, 4) uint8 RGBA numpy  ← Isaac Sim "rgb" 实际输出 4 通道
+   #   observation.state:           (12,)     float32 numpy
+   #
+   # VLAStage2Hook 期望格式:
+   #   observation.images.top_rgb:  (1, C, H, W) float32 tensor [0, 1]
+   #   observation.state:           (1, 12)     float32 tensor
+   #
+   # 转换链: RGBA→RGB → /255 → permute(HWC→CHW) → unsqueeze(+batch) → .to(device)
 
 2. VLA UNIFIED FORWARD on GPU (frozen, ~110ms, shared KV cache)
    z_vlm, a_tilde = vla_hook.forward(obs_gpu)
@@ -620,22 +630,48 @@ def train(cfg):
         # Log & checkpoint
 ```
 
-Key helper: `process_observation()` — unified VLA hook + z_rl encoding + state assembly:
+Key helper: `prepare_obs_batch()` + `process_observation()`:
 
 ```python
+def prepare_obs_batch(obs: dict, device: torch.device) -> dict[str, torch.Tensor]:
+    """
+    Convert env._get_observations() output to VLAStage2Hook format.
+
+    env 输出:
+      observation.images.top_rgb:  (H, W, 4) uint8 RGBA numpy   ← Isaac Sim "rgb" 实际 4 通道
+      observation.state:           (12,)     float32 numpy
+
+    hook 期望:
+      observation.images.top_rgb:  (1, 3, H, W) float32 tensor [0, 1]
+      observation.state:           (1, 12)     float32 tensor
+    """
+    batch = {}
+    for key, value in obs.items():
+        if not key.startswith("observation."):
+            continue
+        if isinstance(value, np.ndarray):
+            t = torch.from_numpy(value.copy()).float()
+            if t.ndim == 3 and t.shape[-1] >= 3:  # Image (H, W, C)
+                t = t[..., :3]                      # RGBA → RGB (取前 3 通道)
+                t = t / 255.0                       # [0, 255] → [0, 1]
+                t = t.permute(2, 0, 1)              # (H, W, C) → (C, H, W)
+            t = t.unsqueeze(0).to(device)           # +batch dim, to GPU
+            batch[key] = t
+    return batch
+
+
 @torch.no_grad()
 def process_observation(obs_dict, vla_hook, stage1, normalizer, device):
     """
     Returns: z_rl(1,960), a_tilde(1,50,12), s_p(1,12)
-    
-    Uses VLAStage2Hook for a single VLM forward to get z_vlm and ã.
- 
-    """
-    # 1. VLA unified forward — 一次 VLM forward, 同时获取 z_vlm 和 ã
- batch = prepare_vla_batch(obs_dict, device)    z_vlm = vla_hook.extract_prefix(batch)           # (1, 196, 960) on GPU
 
-    # 2. VLA reference actions (full SmolVLA pipeline)
-    a_tilde = vla_sample_actions(batch, vla_hook, vla_policy)  # (1, 50, 12) on GPU
+    Uses VLAStage2Hook for a single VLM forward to get z_vlm and ã.
+    """
+    # 1. 格式转换: env numpy RGBA → hook tensor RGB
+    batch = prepare_obs_batch(obs_dict, device)
+
+    # 2. VLA unified forward — 一次 VLM forward, 同时获取 z_vlm 和 ã
+    z_vlm, a_tilde = vla_hook.forward(batch)
 
     # 3. RL Token encode
     z_target = stage1.apply_keep_mask(z_vlm)          # (1, 193, 960)
