@@ -15,6 +15,7 @@ Pipeline:
 import argparse
 import copy
 import json
+import random
 import time
 from pathlib import Path
 
@@ -242,6 +243,15 @@ def train(cfg: dict, simulation_app):
     env.initialize_obs()
     print(f"  Env: {args_namespace.task}, garment={cfg['garment_name']}")
 
+    # Load garment list for random sampling
+    parts = cfg["garment_name"].split("_")
+    garment_type = f"{parts[0]}_{parts[1]}"  # e.g., "Top_Long"
+    garment_list_path = Path(cfg["garment_cfg_base_path"]) / "Release" / garment_type / f"{garment_type}.txt"
+    with open(garment_list_path) as f:
+        all_garments = [line.strip() for line in f if line.strip()]
+    seen_garments = [g for g in all_garments if "Seen" in g]
+    print(f"  Garment pool: {len(seen_garments)} seen + {len(all_garments) - len(seen_garments)} unseen = {len(all_garments)} total")
+
     # ── Phase 4: Warmup ──
     print("\n" + "=" * 60)
     print(f"Phase 4: Warmup ({cfg['warmup_episodes']} episodes)")
@@ -249,6 +259,8 @@ def train(cfg: dict, simulation_app):
 
     warmup_start = time.time()
     for ep in range(cfg["warmup_episodes"]):
+        garment = random.choice(seen_garments)
+        env.switch_garment(garment, "Release")
         env.reset()
         stabilize_garment_after_reset(env, args_namespace)
         obs = env._get_observations()
@@ -351,6 +363,8 @@ def train(cfg: dict, simulation_app):
     best_reward = -float("inf")
 
     for ep in range(cfg["total_episodes"]):
+        garment = random.choice(all_garments)
+        env.switch_garment(garment, "Release")
         env.reset()
         stabilize_garment_after_reset(env, args_namespace)
         obs = env._get_observations()
