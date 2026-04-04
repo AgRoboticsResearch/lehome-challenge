@@ -77,10 +77,18 @@ class VLAPrefixHook:
 
             policy = SmolVLAPolicy.from_pretrained(str(path))
             state_dict = policy.model.state_dict()
-            self.model.load_state_dict(state_dict, strict=False)
+            result = self.model.load_state_dict(state_dict, strict=False)
+            if result.missing_keys or result.unexpected_keys:
+                print(f"  ⚠️ load_state_dict: missing={result.missing_keys}, unexpected={result.unexpected_keys}")
+            else:
+                print(f"  ✅ All checkpoint weights loaded (no missing/unexpected keys)")
         elif path.suffix in (".pt", ".safetensors"):
             state_dict = torch.load(pretrained_path, map_location="cpu", weights_only=True)
-            self.model.load_state_dict(state_dict, strict=False)
+            result = self.model.load_state_dict(state_dict, strict=False)
+            if result.missing_keys or result.unexpected_keys:
+                print(f"  ⚠️ load_state_dict: missing={result.missing_keys}, unexpected={result.unexpected_keys}")
+            else:
+                print(f"  ✅ All checkpoint weights loaded (no missing/unexpected keys)")
 
     def _tokenize_language(self):
         processor = self.model.vlm_with_expert.processor
