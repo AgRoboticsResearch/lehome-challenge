@@ -433,7 +433,6 @@ def main():
 
     parser = argparse.ArgumentParser(description="Stage 2 RL Token Training")
     parser.add_argument("--config", type=str, required=True, help="YAML config path")
-    parser.add_argument("--headless", action="store_true", help="Run headless (no GUI)")
     parser.add_argument("--device", type=str, default=None, help="Device override (cpu/cuda)")
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
