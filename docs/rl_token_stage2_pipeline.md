@@ -22,6 +22,9 @@ Stage 1 (offline, already implemented) trains an RL Token Encoder/Decoder to com
 | Eval ã | **Full VLA at eval** | Paper-faithful, fast enough on GPU |
 | **Normalization** | **Dataset stats only** | joint_pos/action 用 dataset stats.json；z_rl 不归一化（已由 Stage 1 控制） |
 | **Actor 初始化** | **BC pretrain from warmup data** | 从 VLA 行为克隆开始，避免 random actor 产生垃圾数据 |
+| **VLA 集成** | **VLAStage2Hook（共享 KV Cache）** | 一次 VLM forward 同时产出 z_vlm 和 ã，避免重复计算，每 chunk 省 ~60ms |
+| **next_z_rl** | **延迟一拍存储** | 用当前 chunk 的 z_rl 作为上一条 transition 的 next_z_rl，每 chunk 只需一次 VLA forward |
+| **Garment 范围** | **单 garment** | 先只支持单 garment 类型（如 top_long），后续再扩展 |
 
 ---
 
@@ -38,9 +41,11 @@ Every C=10 steps:
    obs = env._get_observations()   # CPU numpy dicts
    obs_gpu = {k: torch.as_tensor(v).to(device) for k,v in obs.items()}
 
-2. VLA FORWARD on GPU (frozen, ~50-200ms)
-   z_vlm = vla_hook.extract_prefix(obs_gpu)              # (1, 196, 960)
-   a_tilde = vla.sample_actions(...)[:, :C, :]           # (1, 10, 12)
+2. VLA UNIFIED FORWARD on GPU (frozen, ~65-145ms, shared KV cache)
+   z_vlm, a_tilde = vla_hook.forward(obs_gpu)
+                     ↑ z_vlm: (1, 196, 960)    ← VLM hidden states
+                     ↑ a_tilde: (1, 50, 12)    ← ODE denoised actions
+                     ↑ 一次 VLM forward，KV cache 在 z_vlm 提取和 ã 去噪间共享
 
 3. RL TOKEN on GPU (frozen, fast)
    z_target = apply_keep_mask(z_vlm)                     # (1, 193, 960)
@@ -84,6 +89,160 @@ Every C=10 steps:
    batch = replay_buffer.sample(256)
    2x critic_update → 1x actor_update → target soft update
 ```
+
+---
+
+## VLA Unified Hook (VLAStage2Hook)
+
+### 问题：为什么不能分开调用
+
+Stage 2 每个chunk需要**同时**获取两个输出：
+- **z_vlm** (196×960) → 送入 RL Token Encoder → z_rl（状态表示）
+- **ã** (50×12) → VLA 参考动作（Actor 的 ref 输入 + BC 正则化 target）
+
+SmolVLA 的 `sample_actions()` 内部是严格的两阶段 pipeline：
+
+```
+Phase 1: VLM Forward（昂贵，~50-80ms）
+  embed_prefix(images, lang, state) → prefix_embs (~778 tokens)
+  vlm_with_expert.forward(prefix_embs, fill_kv_cache=True)
+    → 返回两个值:
+      (1) outputs_embeds[0] = z_vlm (hidden states)
+      (2) past_key_values    = KV cache (用于 Phase 2)
+
+Phase 2: ODE Denoising（~20-50ms，10步）
+  for step in range(10):
+    denoise_step(x_t, t, past_key_values)  # 复用 KV cache
+    x_t += dt * v_t
+  return x_t → ã (50×12)
+```
+
+现有代码的问题：
+
+| 组件 | 调用了什么 | 保留了什么 | **丢弃了什么** |
+|---|---|---|---|
+| `VLAPrefixHook.extract_prefix()` | Phase 1 完整 VLM forward | `outputs[0]` (z_vlm) ✅ | `past_key_values` ❌ |
+| `VLAFlowMatching.sample_actions()` | Phase 1 + Phase 2 | `past_key_values` → ã ✅ | `outputs[0]` (z_vlm) ❌ |
+
+两者各做一次完整的 VLM forward，各丢弃对方需要的输出。**分开调用 = VLM backbone 跑两次 = ~2x 耗时。**
+
+### 什么是 KV Cache
+
+Transformer 的 Self-Attention 为每个 token 计算 Q (Query)、K (Key)、V (Value)。
+当序列分为 Prefix（固定的观测）和 Suffix（变化的 action tokens）时：
+
+- Prefix tokens 的 K 和 V 在整个 action 生成过程中**不变**
+- KV Cache = 把 Prefix 的 K/V 存起来，10 步 ODE denoising 直接复用，不重复计算
+
+```
+没有 KV Cache:
+  去噪第1步: 算 Prefix(778 tokens) 的 K,V + Suffix(50 tokens) 的 K,V → Attention
+  去噪第2步: 算 Prefix(778 tokens) 的 K,V + Suffix(50 tokens) 的 K,V → Attention
+  ...（重复 10 次）
+  总 token 处理量: 778 + 10×828 = 9,058
+
+有 KV Cache:
+  预先算一次: Prefix 的 K,V → 存入 cache
+  去噪第1步: 取缓存的 K,V + 只算 Suffix(50) 的 K,V → Attention
+  去噪第2步: 取缓存的 K,V + 只算 Suffix(50) 的 K,V → Attention
+  ...（复用 10 次）
+  总 token 处理量: 778 + 10×50 = 1,278
+
+加速比: ~7x
+```
+
+### 解决方案：VLAStage2Hook
+
+一次 VLM forward 同时产出 z_vlm 和 ã，共享 KV Cache：
+
+```python
+class VLAStage2Hook:
+    """
+    统一的 VLA 接口：一次 VLM forward 同时返回 z_vlm 和 ã。
+    
+    与现有 VLAPrefixHook 的关系：
+    - 复用 VLAPrefixHook 的 __init__（构建模型、加载权重、tokenize 语言）
+    - 复用 prepare_images()、prepare_state() 等数据预处理方法
+    - 额外调用 VLAFlowMatching 的 denoise_step()（ODE 去噪生成 ã）
+    
+    不比现有 VLAPrefixHook 更 "hacky"——访问的是同层级的内部 API。
+    """
+    
+    def __init__(self, pretrained_path, device, task_description, image_keys, state_dim=12):
+        # 复用 VLAPrefixHook 的初始化逻辑
+        self.prefix_hook = VLAPrefixHook(
+            pretrained_path=pretrained_path,
+            device=device,
+            task_description=task_description,
+            image_keys=image_keys,
+            state_dim=state_dim,
+        )
+        self.model = self.prefix_hook.model  # VLAFlowMatching, 已冻结
+        self.device = self.prefix_hook.device
+    
+    @torch.no_grad()
+    def forward(self, obs_dict):
+        """
+        一次 VLM forward 同时产出 z_vlm 和 ã。
+        
+        Args:
+            obs_dict: 包含 observation.state, observation.images.* 的 dict
+        
+        Returns:
+            z_vlm: (B, ~196, 960) — VLM hidden states，送入 RL Token Encoder
+            a_tilde: (B, 50, 12) — VLA 参考动作，送入 Actor 作为 ref
+        """
+        # ── Phase 1: Embed Prefix（与 VLAPrefixHook.extract_prefix() 相同）──
+        images, img_masks = self.prefix_hook.prepare_images(obs_dict)
+        state = self.prefix_hook.prepare_state(obs_dict["observation.state"])
+        B = state.shape[0]
+        lang_tokens = self.prefix_hook._lang_tokens.expand(B, -1).to(self.device)
+        lang_masks = self.prefix_hook._lang_masks.expand(B, -1).to(self.device)
+        
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.model.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        
+        # ── 一次 VLM forward，同时获取 z_vlm 和 KV cache ──
+        outputs_embeds, past_key_values = self.model.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,           # ← 关键：保留 KV cache
+            fill_kv_cache=True,
+        )
+        z_vlm = outputs_embeds[0]  # (B, ~196, 960)
+        
+        # ── Phase 2: ODE Denoising（复用 KV cache，不重复 VLM forward）──
+        chunk_size = self.model.config.chunk_size  # 50
+        max_action_dim = self.model.config.max_action_dim  # 32
+        action_dim = 12
+        num_steps = self.model.config.num_steps  # 10
+        dt = -1.0 / num_steps
+        
+        x_t = self.model.sample_noise((B, chunk_size, max_action_dim), self.device)
+        for step in range(num_steps):
+            time = 1.0 + step * dt
+            time_tensor = torch.tensor(time, device=self.device).expand(B)
+            v_t = self.model.denoise_step(
+                prefix_pad_masks, past_key_values, x_t, time_tensor
+            )
+            x_t = x_t + dt * v_t
+        
+        a_tilde = x_t[:, :, :action_dim]  # (B, 50, 12)
+        return z_vlm, a_tilde
+```
+
+### 性能对比
+
+| 方案 | VLM Forward 次数 | 每chunk耗时 | 500 episodes |
+|---|---|---|---|
+| 分开调用（VLAPrefixHook + LeRobotPolicy） | 2 次 | ~160ms | ~7.2 小时 |
+| **统一 Hook（VLAStage2Hook）** | **1 次** | **~100ms** | **~1.7-3.6 小时** |
+| 节省 | 50% | ~37% | **~3.6 小时** |
 
 ---
 
@@ -210,9 +369,9 @@ Why this is safe:
 
 ## Files to Create
 
-### 1. `source/lehome/lehome/models/rl_stage2.py` (~400 lines)
-
-Core Stage 2 components:
+### 2. `scripts/train_rl_token_stage2.py` (~450 lines)
+### 3. `scripts/eval_policy/rlt_policy.py` (~150 lines)
+### 4. `scripts/eval_policy/__init__.py` (+1 行)Core Stage 2 components:
 
 #### ReplayBuffer
 
@@ -460,17 +619,19 @@ def train(cfg):
         # Log & checkpoint
 ```
 
-Key helper: `process_observation()` — combines VLA prefix extraction + z_rl encoding + state assembly:
+Key helper: `process_observation()` — unified VLA hook + z_rl encoding + state assembly:
 
 ```python
 @torch.no_grad()
 def process_observation(obs_dict, vla_hook, stage1, normalizer, device):
     """
     Returns: z_rl(1,960), a_tilde(1,50,12), s_p(1,12)
+    
+    Uses VLAStage2Hook for a single VLM forward to get z_vlm and ã.
+ 
     """
-    # 1. VLA prefix -> z_vlm
-    batch = prepare_vla_batch(obs_dict, device)
-    z_vlm = vla_hook.extract_prefix(batch)           # (1, 196, 960) on GPU
+    # 1. VLA unified forward — 一次 VLM forward, 同时获取 z_vlm 和 ã
+ batch = prepare_vla_batch(obs_dict, device)    z_vlm = vla_hook.extract_prefix(batch)           # (1, 196, 960) on GPU
 
     # 2. VLA reference actions (full SmolVLA pipeline)
     a_tilde = vla_sample_actions(batch, vla_hook, vla_policy)  # (1, 50, 12) on GPU
@@ -554,11 +715,10 @@ class RLTPolicy(BasePolicy):
     Uses full VLA reference at eval (paper-faithful).
     """
 
-    def __init__(self, smolvla_pretrained_path, rl_token_stage1_path, actor_path,
-                 dataset_stats_path, task_description="fold the garment",
-                 chunk_size=10, device="cuda"):
-        self.vla_hook = VLAPrefixHook(pretrained_path=..., device=device)
-        self.vla_policy = SmolVLAPolicy.from_pretrained(...)  # for ã at eval
+    def __init__(self, smolvla_pretrained_path=None, rl_token_stage1_path=None,
+                 dataset_stats_path=None, task_description="fold the garment",
+                  chunk_size=10, device="cuda"):
+        self.vla_hook = VLAStage2Hook(pretrained_path=smolvla_pretrained_path, device=device)
         self.stage1 = load_frozen_stage1(rl_token_stage1_path, device)
         self.actor = load_trained_actor(actor_path, device)
         self.normalizer = SimpleNormalizer(dataset_stats_path, device)
@@ -575,10 +735,9 @@ class RLTPolicy(BasePolicy):
 
     def _replan(self, observation):
         with torch.no_grad():
-            # 1. VLA forward (GPU) — get z_vlm AND ã
-            batch = prepare_vla_batch(observation, self.device)
-            z_vlm = self.vla_hook.extract_prefix(batch)
-            a_tilde = vla_sample_actions(batch, self.vla_hook, self.vla_policy)[:, :C, :]
+            # 1. VLA unified forward (GPU) — 一次 VLM forward, shared KV cache
+            z_vlm, a_tilde = self.vla_hook.forward(observation)
+            a_tilde_c = a_tilde[:, :self.chunk_size, :]
 
             # 2. RL Token (GPU)
             z_target = self.stage1.apply_keep_mask(z_vlm)
@@ -676,16 +835,360 @@ This is very feasible!
 
 ## Implementation Order
 
-| Step | File | Lines | Notes |
-|------|------|-------|-------|
-| 1 | `configs/train_rl_stage2.yaml` | ~40 | Config first |
-| 2 | `source/lehome/lehome/models/rl_stage2.py` | ~400 | Core: Normalizer, Actor, Critic, Buffer, Trainer |
-| 3 | `scripts/train_rl_token_stage2.py` | ~450 | Training loop |
-| 4 | `scripts/eval_policy/rlt_policy.py` | ~150 | Eval wrapper |
-| 5 | `scripts/eval_policy/__init__.py` | ~1 | Register policy |
+### 0. `source/lehome/lehome/models/vla_stage2_hook.py` (~120 lines) — **NEW**
+
+> **NEW**
+
+统一 VLA Hook： 一次 VLM forward 同时产出 z_vlm 和 ã， 共享 KV Cache，避免重复计算
+
+| 2 | `source/lehome/lehome/models/rl_stage2.py` (~400 lines) | Core: Normalizer, Actor, Critic, Buffer, Trainer |
+
 
 **No env modification needed** — only `observation.state` from standard obs dict.
 
 **Normalization**: Replay buffer stores normalized joint_pos and actions (via `stats.json`),
 raw z_rl (no normalization), and raw rewards. Actor output denormalized before `env.step()`.
 BC loss in normalized space, naturally aligned with VLA output.
+
+---
+
+## Architecture Diagrams
+
+### 1. Component Overview
+
+```
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                          STAGE 2: 组件架构                                  ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                            ║
+║  ┌───────────────────── FROZEN (from Stage 1) ──────────────────────┐      ║
+║  │                                                                   │      ║
+║  │  ┌──────────────┐   ┌──────────────┐   ┌──────────────────────┐  │      ║
+║  │  │  SmolVLA     │   │  RL Token    │   │  VLA Action Expert   │  │      ║
+║  │  │  VLM Prefix  │──▶│  Encoder     │   │  (ODE Denoiser)      │  │      ║
+║  │  │  (SigLIP+    │   │  (2-layer    │   │                      │  │      ║
+║  │  │   Gemma)     │   │   transformer│   │  z_vlm ──▶ ã[0:50]  │  │      ║
+║  │  │              │   │   + LayerNorm)│   │  (50 steps × 12D)   │  │      ║
+║  │  │ images+lang  │   │              │   │                      │  │      ║
+║  │  │ ──▶ z_vlm    │   │ z_target     │   └──────────┬───────────┘  │      ║
+║  │  │ (196×960)    │   │ ──▶ z_rl     │              │              │      ║
+║  │  └──────────────┘   │ (1×960)      │              │ ã (ref)      │      ║
+║  │        │             └──────┬───────┘              │              │      ║
+║  │        │ z_vlm            │ z_rl                  │              │      ║
+║  └────────│──────────────────│──────────────────────│──────────────┘      ║
+║           │                  │                      │                      ║
+║           │                  ▼                      ▼                      ║
+║  ┌───────────────────── TRAINABLE ────────────────────────────────────┐    ║
+║  │                                                                    │    ║
+║  │  ┌─────────────────────────────────────────────────────────────┐   │    ║
+║  │  │                      SimpleNormalizer                       │   │    ║
+║  │  │  dataset stats.json (fixed, no running stats)               │   │    ║
+║  │  │  • joint_pos:  raw ──▶ normalized  (x - mean) / std        │   │    ║
+║  │  │  • action:     raw ──▶ normalized  (x - mean) / std        │   │    ║
+║  │  │  • z_rl:       不归一化 (Stage 1 LayerNorm 已控制)          │   │    ║
+║  │  └─────────────────────────────────────────────────────────────┘   │    ║
+║  │                                                                    │    ║
+║  │  ┌──────────────┐     ┌──────────────────────────────────────┐    │    ║
+║  │  │   RLActor    │     │           TwinCritic                 │    │    ║
+║  │  │              │     │                                      │    │    ║
+║  │  │ state + ref  │     │  state + action                     │    │    ║
+║  │  │    │         │     │    │                                 │    │    ║
+║  │  │    ▼         │     │    ▼                                 │    │    ║
+║  │  │ ┌──────────┐ │     │ ┌──────────┐  ┌──────────┐         │    │    ║
+║  │  │ │concat+   │ │     │ │  Q1      │  │  Q2      │         │    │    ║
+║  │  │ │MLP       │ │     │ │  MLP     │  │  MLP     │         │    │    ║
+║  │  │ │1092→512→ │ │     │ │1092→512→ │  │1092→512→ │         │    │    ║
+║  │  │ │512→120   │ │     │ │512→1     │  │512→1     │         │    │    ║
+║  │  │ └────┬─────┘ │     │ └────┬─────┘  └────┬─────┘         │    │    ║
+║  │  │      │       │     │      │             │               │    │    ║
+║  │  │      ▼       │     │      ▼             ▼               │    │    ║
+║  │  │  μ(10×12)    │     │   Q1(s,a)     Q2(s,a)             │    │    ║
+║  │  │  σ=0.0067    │     │      └─────┬───────┘               │    │    ║
+║  │  │  (fixed)     │     │            ▼                       │    │    ║
+║  │  │      │       │     │   min(Q1, Q2) ← clipped double-Q  │    │    ║
+║  │  │      ▼       │     │                                      │    │    ║
+║  │  │ a = μ+σ·ε   │     └──────────────────────────────────────┘    │    ║
+║  │  │ (reparam.)  │                                               │    ║
+║  │  └──────────────┘                                               │    ║
+║  │                                                                │    ║
+║  │  ┌──────────────────────────────────────────────────────────┐   │    ║
+║  │  │                    ReplayBuffer (GPU)                    │   │    ║
+║  │  │  circular, capacity=100K, stores chunk-level transitions │   │    ║
+║  │  └──────────────────────────────────────────────────────────┘   │    ║
+║  └─────────────────────────────────────────────────────────────────┘    ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+```
+
+### 2. State Assembly (Symmetric Actor/Critic)
+
+```
+                    输入组装：对称 Actor/Critic
+
+     ┌─────────────────────────────────────────────────────┐
+     │                                                     │
+     │   z_rl ──────────────────────────── 不归一化 ──┐    │
+     │   (960D, norm≈28)                              │    │
+     │                                                 │    │
+     │   joint_pos ── (x-mean)/std ── 归一化 ───────┐ │    │
+     │   (12D raw)                                   │ │    │
+     │                                                ▼ ▼    │
+     │                                          ┌─────────┐ │
+     │                                          │ concat  │ │
+     │                                          │ (972D)  │ │
+     │                                          └────┬────┘ │
+     │                                               │      │
+     │                    ┌──────────────────────────┤      │
+     │                    │                          │      │
+     │                    ▼                          ▼      │
+     │             ┌───────────┐            ┌───────────┐  │
+     │             │  Actor    │            │  Critic   │  │
+     │             │           │            │           │  │
+     │  ref ã ────▶│ +ref(120D)│   action ─▶│ +act(120D)│  │
+     │  (10×12)    │           │   (10×12)  │           │  │
+     │  50%dropout │  input    │            │  input    │  │
+     │  →zeros     │  1092D    │            │  1092D    │  │
+     │             └───────────┘            └───────────┘  │
+     └─────────────────────────────────────────────────────┘
+```
+
+### 3. Training Pipeline (3 Phases)
+
+```
+═══════════════════════════════════════════════════════════════════════
+                     STAGE 2 训练流程 (3 Phases)
+═══════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  Phase 4: WARMUP — 用 VLA 填充 ReplayBuffer (不训练 RL)            │
+│                                                                     │
+│  ┌──────────┐    ┌─────────┐    ┌─────────┐    ┌───────────────┐  │
+│  │  env obs │───▶│   VLA   │───▶│ RL Token │───▶│ z_rl + ã + s_p│  │
+│  │  (CPU)   │    │ z_vlm   │    │ encoder │    │               │  │
+│  │          │    │ + ã     │    │  → z_rl  │    │   action = ã  │  │
+│  └──────────┘    └─────────┘    └─────────┘    │  (直接用VLA)  │  │
+│       │                                         └───────┬───────┘  │
+│       │ env.step(ã)                                     │          │
+│       ▼                                                 ▼          │
+│  ┌──────────┐                                    ┌──────────────┐  │
+│  │ rewards  │                                    │ ReplayBuffer │  │
+│  │ r_0..r_9 │──── chunk_return ─────────────────▶│ .add(...)    │  │
+│  └──────────┘                                    └──────────────┘  │
+│                                                                     │
+│  重复 N_warm=20 episodes                                            │
+│  目的：给 Critic 一个初始学习信号                                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Phase 4.5: BC PRETRAIN — 行为克隆初始化 Actor                      │
+│                                                                     │
+│  ┌──────────────┐     ┌────────────────────────────────────┐       │
+│  │ ReplayBuffer │────▶│ sample batch (256)                  │       │
+│  │ (warmup data)│     │ z_rl, s_p, ã(50步), action        │       │
+│  └──────────────┘     └──────────────┬─────────────────────┘       │
+│                                      │                             │
+│                    ┌─────────────────┐│                             │
+│                    │ 滑动窗口增强     ││                             │
+│                    │ stride=2         ││                             │
+│                    │ ã[0:10], ã[2:12] ││                            │
+│                    │ ã[4:14], ...     ││                            │
+│                    │ → ~21 samples    ▼│                            │
+│                    │ per VLA forward  │                             │
+│                    └────────┬─────────┘                             │
+│                             │                                       │
+│                             ▼                                       │
+│  ┌───────────────────────────────────────────────────────────┐     │
+│  │  Actor(z_rl, s_p, ã_chunk) ──▶ a_pred                    │     │
+│  │  Loss = MSE(a_pred, ã_chunk)                               │     │
+│  │  无 dropout (actor 总是看到 ã)                              │     │
+│  │  100 epochs, lr=1e-3, early stop at loss < 0.01           │     │
+│  └───────────────────────────────────────────────────────────┘     │
+│                             │                                       │
+│                             ▼                                       │
+│  actor_target = deepcopy(actor)  ← 同步 target 网络                 │
+│                                                                     │
+│  目的：让 Actor 从 VLA 行为克隆开始，避免 random actor 产生垃圾     │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Phase 5: ONLINE RL — TD3+BC 训练 (主循环)                         │
+│                                                                     │
+│  每个 episode:                                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  COLLECT LOOP (每个 C=10 步执行一次)                        │   │
+│  │                                                             │   │
+│  │  env obs ──▶ VLA ──▶ z_vlm ──▶ z_rl ──▶ ã[0:10]          │   │
+│  │                                         │           │       │   │
+│  │                                         │      ┌────┘       │   │
+│  │                                         ▼      ▼            │   │
+│  │                               Actor(z_rl, s_p, ã)          │   │
+│  │                                  │  50% dropout: ã→zeros   │   │
+│  │                                  ▼                          │   │
+│  │                            a_norm (10×12)                   │   │
+│  │                                  │                          │   │
+│  │                                  ▼ denormalize              │   │
+│  │                            a_raw = a*std+mean               │   │
+│  │                                  │                          │   │
+│  │                                  ▼ send to CPU              │   │
+│  │  ┌───────────────────────────────────────────────────┐     │   │
+│  │  │  for t = 0..9:                                    │     │   │
+│  │  │    obs_t, r_t, done_t = env.step(a_raw[t])  # CPU │     │   │
+│  │  │    rewards.append(r_t)                            │     │   │
+│  │  │    if done_t: break  ← episode 边界提前终止        │     │   │
+│  │  │                                                    │     │   │
+│  │  │  n_exec = len(rewards)  (可能 < C=10)              │     │   │
+│  │  │  chunk_return = Σ γ^t · r_t  (只累加实际执行的)    │     │   │
+│  │  └───────────────────────────────────────────────────┘     │   │
+│  │                          │                                  │   │
+│  │                          ▼                                  │   │
+│  │  ┌───────────────────────────────────────────────────┐     │   │
+│  │  │  ReplayBuffer.add(                                 │     │   │
+│  │  │    z_rl, s_p_norm, ã_full(50步),                  │     │   │
+│  │  │    a_stored, chunk_return,                         │     │   │
+│  │  │    next_z_rl, next_s_p_norm, done                  │     │   │
+│  │  │  )                                                 │     │   │
+│  │  │                                                    │     │   │
+│  │  │  if n_exec < C:                                    │     │   │
+│  │  │    a_stored[:, n_exec:] = 0  # zero-pad phantom    │     │   │
+│  │  │  if done:                                          │     │   │
+│  │  │    next_z_rl = zeros, next_s_p = zeros             │     │   │
+│  │  └───────────────────────────────────────────────────┘     │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                          │                                          │
+│                          ▼  G=5 iterations                          │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  UPDATE LOOP (TD3+BC, 全在 GPU)                             │   │
+│  │                                                             │   │
+│  │  batch = replay.sample(256)                                 │   │
+│  │                                                             │   │
+│  │  ┌─────────────────────────────────────────────────────┐   │   │
+│  │  │  Step 1: CRITIC UPDATE (每次都执行)                  │   │   │
+│  │  │                                                      │   │   │
+│  │  │  next_a = actor_target(z_rl', s_p', ã')  ← 无噪声   │   │   │
+│  │  │  noise = clip(N(0, σ=0.2), [-0.5, 0.5])  ← TD3      │   │   │
+│  │  │  next_a_smooth = (next_a + noise)          ← 平滑    │   │   │
+│  │  │                                                      │   │   │
+│  │  │  target = r + γ^C·(1-d)·min(Q1'(z',s',a_smooth),    │   │   │
+│  │  │                            Q2'(z',s',a_smooth))      │   │   │
+│  │  │         ↑ γ^C=0.99^10≈0.904                          │   │   │
+│  │  │         ↑ done=True → (1-d)=0 → target=r             │   │   │
+│  │  │                                                      │   │   │
+│  │  │  L_Q = MSE(Q1, target) + MSE(Q2, target)            │   │   │
+│  │  └─────────────────────────────────────────────────────┘   │   │
+│  │                                                             │   │
+│  │  ┌─────────────────────────────────────────────────────┐   │   │
+│  │  │  Step 2: ACTOR UPDATE (每2次critic执行1次)           │   │   │
+│  │  │                                                      │   │   │
+│  │  │  ref_dropped = dropout(ã, p=0.5)  → 50% 变 zeros    │   │   │
+│  │  │  a = actor(z_rl, s_p, ref_dropped) ← 注意用dropped  │   │   │
+│  │  │  Q = critic.q1_only(z_rl, s_p, a)                    │   │   │
+│  │  │                                                      │   │   │
+│  │  │  L_π = -Q.mean() + β·MSE(a, ã_original)             │   │   │
+│  │  │         ↑ maximize Q    ↑ BC正则化 (β=0.1)           │   │   │
+│  │  │         ↑                ↑ 注意: BC target 是原始 ã   │   │   │
+│  │  │         ↑                  不是 ref_dropped!          │   │   │
+│  │  └─────────────────────────────────────────────────────┘   │   │
+│  │                                                             │   │
+│  │  ┌─────────────────────────────────────────────────────┐   │   │
+│  │  │  Step 3: TARGET SOFT UPDATE                          │   │   │
+│  │  │                                                      │   │   │
+│  │  │  θ_target ← τ·θ + (1-τ)·θ_target   (τ=0.005)       │   │   │
+│  │  │  分别更新 actor_target 和 critic_target               │   │   │
+│  │  └─────────────────────────────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 4. Data Space Flow (Normalization)
+
+```
+═══════════════════════════════════════════════════════════════
+              数据空间流转图 (Normalization Flow)
+═══════════════════════════════════════════════════════════════
+
+                    ENV (原始空间)
+                    joint_pos: [-1.73, 1.65]
+                    action:    同 joint_pos
+                         │
+            ┌────────────┤
+            │            │
+            ▼            ▼
+     ┌─────────────┐  ┌─────────────┐
+     │ normalize   │  │ normalize   │
+     │ (stats.json)│  │ (stats.json)│
+     │             │  │             │
+     │ jp → s_p   │  │ act → a_norm│
+     │ (12D, ~N01) │  │ (12D, ~N01) │
+     └──────┬──────┘  └──────┬──────┘
+            │                │
+            ▼                │
+     ┌─────────────┐         │
+     │  z_rl (960D)│         │
+     │  不归一化    │         │
+     │  norm ≈ 28  │         │
+     └──────┬──────┘         │
+            │                │
+            ▼                │
+     ┌─────────────┐         │
+     │ state =     │         │
+     │ [z_rl, s_p] │         │
+     │ (972D)      │         │
+     └──────┬──────┘         │
+            │                │
+            ▼                ▼
+     ┌──────────────────────────────────────────┐
+     │          ACTOR / CRITIC 空间             │
+     │                                          │
+     │  Actor input:  state(972) + ref(120)     │
+     │  Actor output: a_pred(120) ← normalized  │
+     │  Critic input: state(972) + act(120)     │
+     │  Critic output: Q ∈ R                    │
+     │                                          │
+     │  BC loss: ||a_pred - ã_norm||²           │
+     │           ↑ 都在 normalized 空间!         │
+     └──────────────────────┬───────────────────┘
+                            │
+                            ▼ denormalize
+                     a_raw = a_pred * std + mean
+                            │
+                            ▼
+                    ENV (原始空间)
+                    env.step(a_raw)
+```
+
+### 5. Episode Boundary Handling (Partial Chunks)
+
+```
+═════════════════════════════════════════════════════════
+         Episode 边界：Partial Chunk 处理
+═════════════════════════════════════════════════════════
+
+正常情况 (n_exec = C = 10):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  action: [a₀, a₁, a₂, a₃, a₄, a₅, a₆, a₇, a₈, a₉]
+  exec:   [ ✓   ✓   ✓   ✓   ✓   ✓   ✓   ✓   ✓   ✓ ]
+  reward: [r₀, r₁, r₂, r₃, r₄, r₅, r₆, r₇, r₈, r₉]
+
+  chunk_return = r₀ + γr₁ + γ²r₂ + ... + γ⁹r₉
+  next_z_rl = encode(obs₉)
+  done = False
+
+提前终止 (n_exec = 5, done=True at step 5):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  action: [a₀, a₁, a₂, a₃, a₄, a₅, a₆, a₇, a₈, a₉]
+  exec:   [ ✓   ✓   ✓   ✓   ✓   ─   ─   ─   ─   ─ ]
+  reward: [r₀, r₁, r₂, r₃, r₄]
+
+  a_stored: [a₀, a₁, a₂, a₃, a₄,  0,  0,  0,  0,  0]
+                                        ↑ zero-pad phantom
+
+  chunk_return = r₀ + γr₁ + γ²r₂ + γ³r₃ + γ⁴r₄
+  next_z_rl = zeros  ← terminal state
+  next_s_p  = zeros
+  done = True
+
+  TD target = chunk_return + γ^C · (1-done) · Q_target(...)
+            = chunk_return + 0
+            = chunk_return  ← phantom actions 无影响
+```
