@@ -250,16 +250,17 @@ def train(cfg: dict, simulation_app):
 
     warmup_start = time.time()
     for ep in range(cfg["warmup_episodes"]):
+        print(f"  [DEBUG] Ep {ep+1}: calling env.reset()...", flush=True)
         obs, info = env.reset()
+        print(f"  [DEBUG] Ep {ep+1}: env.reset() done, calling stabilize...", flush=True)
         stabilize_garment_after_reset(env, args_namespace)
-
-        print(f"  [DEBUG] Ep {ep+1}: about to process_observation, obs keys={list(obs.keys())[:5]}...")
+        print(f"  [DEBUG] Ep {ep+1}: stabilize done, obs keys={list(obs.keys())[:5]}", flush=True)
         for k, v in obs.items():
             if isinstance(v, np.ndarray):
-                print(f"    {k}: shape={v.shape}, dtype={v.dtype}")
+                print(f"    {k}: shape={v.shape}, dtype={v.dtype}", flush=True)
         t0 = time.time()
         z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
-        print(f"  [DEBUG] process_observation done in {time.time()-t0:.1f}s")
+        print(f"  [DEBUG] process_observation done in {time.time()-t0:.1f}s", flush=True)
         episode_reward = 0
 
         while True:
