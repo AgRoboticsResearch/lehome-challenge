@@ -39,7 +39,7 @@ update_to_data_ratio: 5
 replay_capacity: 100000
 
 # ── Warmup ──
-warmup_episodes: 5
+warmup_episodes: 20
 
 # ── BC Pretrain ──
 bc_pretrain_epochs: 100
