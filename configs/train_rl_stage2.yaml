@@ -1,0 +1,57 @@
+# Stage 2 RL Token Training Config
+
+# ── Frozen components ──
+smolvla_pretrained_path: outputs/moe_train/smolvla_moe_expert_top_long_no_st_proj/checkpoints/008000/pretrained_model
+rl_token_stage1_path: outputs/rl_token/stage1/checkpoints/step_10000/rl_token_stage1.pt
+dataset_stats_path: Datasets/example/top_long_merged/meta/stats.json
+task_description: "fold the garment"
+
+# ── Environment (CPU) ──
+task: LeHome-BiSO101-Direct-Garment-v2
+garment_name: Top_Long_Unseen_0
+garment_version: Release
+garment_cfg_base_path: Assets/objects/Challenge_Garment/Release/
+particle_cfg_path: Assets/objects/Challenge_Garment/particle_config/
+
+# ── Architecture ──
+chunk_size: 10
+z_rl_dim: 960
+state_dim: 12
+action_dim: 12
+hidden_dim: 512
+num_layers: 3
+fixed_std: 0.0067             # exp(-5)
+ref_dropout: 0.5              # 50% during RL training
+
+# ── Training ──
+actor_lr: 3.0e-4
+critic_lr: 3.0e-4
+gamma: 0.99                   # per-step; trainer uses gamma^C = 0.99^10 ≈ 0.904
+tau: 0.005                    # Polyak averaging
+beta: 0.1                     # BC regularization weight
+actor_delay: 2                # Update actor every 2 critic steps
+target_noise_std: 0.2         # TD3 target policy smoothing σ
+noise_clip: 0.5               # TD3 noise clip c
+grad_clip: 1.0
+update_to_data_ratio: 5
+
+# ── Replay Buffer ──
+replay_capacity: 100000
+
+# ── Warmup ──
+warmup_episodes: 20
+
+# ── BC Pretrain ──
+bc_pretrain_epochs: 100
+bc_batches_per_epoch: 100
+bc_lr: 1.0e-3
+bc_loss_threshold: 0.01
+
+# ── Run ──
+total_episodes: 500
+batch_size: 256
+output_dir: outputs/rl_token/stage2
+save_freq: 50
+device: cuda
+env_device: cpu
+seed: 42
