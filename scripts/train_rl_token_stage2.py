@@ -120,7 +120,7 @@ def execute_chunk(env, action_raw: np.ndarray, max_steps: int, gamma: float):
     return rewards, done, obs
 
 
-def compute_chunk_return(rewards, list[float], gamma: float) -> float:
+def compute_chunk_return(rewards: list[float], gamma: float) -> float:
     return sum(gamma ** t * r for t, r in enumerate(rewards))
 
 
