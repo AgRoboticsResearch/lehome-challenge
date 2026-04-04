@@ -189,7 +189,7 @@ class RLActor(nn.Module):
         """50% dropout: replace ref with zeros."""
         if training and self.ref_dropout > 0:
             mask = torch.rand(ref_action.shape[0], 1, device=ref_action.device) > self.ref_dropout
-            ref_action = ref_action * mask.float().unsqueeze(-1)
+            ref_action = ref_action * mask.float()
         return ref_action
 
     def forward(self, z_rl: torch.Tensor, s_p: torch.Tensor, ref_action: torch.Tensor) -> torch.Tensor:
