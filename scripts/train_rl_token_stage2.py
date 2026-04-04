@@ -88,9 +88,7 @@ def process_observation(obs_dict, vla_hook, stage1, normalizer, device):
         s_p:     (1, 12) — normalized joint positions
     """
     batch = prepare_obs_batch(obs_dict, device)
-    print(f"    [DEBUG] prepare_obs_batch done, keys={list(batch.keys())}, shapes={[v.shape for v in batch.values()]}")
     z_vlm, a_tilde = vla_hook.forward(batch)
-    print(f"    [DEBUG] vla_hook.forward done, z_vlm={z_vlm.shape}, a_tilde={a_tilde.shape}")
 
     z_target = stage1.apply_keep_mask(z_vlm)
     z_rl = stage1.encoder(z_target)
@@ -250,20 +248,15 @@ def train(cfg: dict, simulation_app):
 
     warmup_start = time.time()
     for ep in range(cfg["warmup_episodes"]):
-        print(f"  [DEBUG] Ep {ep+1}: calling env.reset()...", flush=True)
         obs, info = env.reset()
-        print(f"  [DEBUG] Ep {ep+1}: env.reset() done, calling stabilize...", flush=True)
         stabilize_garment_after_reset(env, args_namespace)
-        print(f"  [DEBUG] Ep {ep+1}: stabilize done, obs keys={list(obs.keys())[:5]}", flush=True)
-        for k, v in obs.items():
-            if isinstance(v, np.ndarray):
-                print(f"    {k}: shape={v.shape}, dtype={v.dtype}", flush=True)
-        t0 = time.time()
-        z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
-        print(f"  [DEBUG] process_observation done in {time.time()-t0:.1f}s", flush=True)
-        episode_reward = 0
 
-        while True:
+        z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
+        episode_reward = 0
+        episode_steps = 0
+        max_steps = cfg.get("max_episode_steps", 300)
+
+        while episode_steps < max_steps:
             # Use VLA actions directly
             action_chunk_norm = a_tilde[:, :chunk_size, :]
             action_raw_np = normalizer.denormalize_action(action_chunk_norm).squeeze(0).cpu().numpy()
@@ -272,6 +265,7 @@ def train(cfg: dict, simulation_app):
             n_exec = len(rewards)
             chunk_return = compute_chunk_return(rewards, gamma)
             episode_reward += sum(rewards)
+            episode_steps += n_exec
 
             action_stored = action_chunk_norm.clone()
             if n_exec < chunk_size:
@@ -355,9 +349,11 @@ def train(cfg: dict, simulation_app):
 
         z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
         episode_reward = 0
+        episode_steps = 0
+        max_steps = cfg.get("max_episode_steps", 300)
         episode_metrics = {"critic_loss": [], "actor_loss": [], "bc_loss": []}
 
-        while True:
+        while episode_steps < max_steps:
             # Actor forward with ref dropout
             actor.train()
             action_norm = actor(z_rl, s_p, a_tilde[:, :chunk_size, :])
@@ -369,6 +365,7 @@ def train(cfg: dict, simulation_app):
             n_exec = len(rewards)
             chunk_return = compute_chunk_return(rewards, gamma)
             episode_reward += sum(rewards)
+            episode_steps += n_exec
 
             action_stored = action_norm.detach().view(1, chunk_size, cfg["action_dim"]).clone()
             if n_exec < chunk_size:
