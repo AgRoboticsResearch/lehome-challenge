@@ -103,7 +103,7 @@ def process_observation(obs_dict, vla_hook, stage1, normalizer, device):
 
 
 def execute_chunk(env, action_raw: np.ndarray, max_steps: int, gamma: float):
-    """Execute action chunk open-loop on return rewards and done flag."""
+    """Execute action chunk open-loop, checking success each step."""
     rewards = []
     done = False
     for t in range(max_steps):
@@ -113,6 +113,11 @@ def execute_chunk(env, action_raw: np.ndarray, max_steps: int, gamma: float):
         r = reward.item() if torch.is_tensor(reward) else float(reward)
         rewards.append(r)
         if done:
+            break
+        # Success doesn't trigger terminated — check explicitly
+        success = env._get_success()
+        if success.item() if torch.is_tensor(success) else bool(success):
+            done = True
             break
     return rewards, done, obs
 
