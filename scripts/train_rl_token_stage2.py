@@ -149,8 +149,8 @@ def train(cfg: dict, simulation_app):
     )
 
     stage1 = RLTokenStage1()
-    state_dict = torch.load(cfg["rl_token_stage1_path"], map_location=device, weights_only=True)
-    stage1.load_state_dict(state_dict)
+    ckpt = torch.load(cfg["rl_token_stage1_path"], map_location=device, weights_only=False)
+    stage1.load_state_dict(ckpt["model_state_dict"])
     stage1.eval()
     for p in stage1.parameters():
         p.requires_grad = False
