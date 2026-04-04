@@ -88,7 +88,9 @@ def process_observation(obs_dict, vla_hook, stage1, normalizer, device):
         s_p:     (1, 12) — normalized joint positions
     """
     batch = prepare_obs_batch(obs_dict, device)
+    print(f"    [DEBUG] prepare_obs_batch done, keys={list(batch.keys())}, shapes={[v.shape for v in batch.values()]}")
     z_vlm, a_tilde = vla_hook.forward(batch)
+    print(f"    [DEBUG] vla_hook.forward done, z_vlm={z_vlm.shape}, a_tilde={a_tilde.shape}")
 
     z_target = stage1.apply_keep_mask(z_vlm)
     z_rl = stage1.encoder(z_target)
@@ -251,7 +253,13 @@ def train(cfg: dict, simulation_app):
         obs, info = env.reset()
         stabilize_garment_after_reset(env, args_namespace)
 
+        print(f"  [DEBUG] Ep {ep+1}: about to process_observation, obs keys={list(obs.keys())[:5]}...")
+        for k, v in obs.items():
+            if isinstance(v, np.ndarray):
+                print(f"    {k}: shape={v.shape}, dtype={v.dtype}")
+        t0 = time.time()
         z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
+        print(f"  [DEBUG] process_observation done in {time.time()-t0:.1f}s")
         episode_reward = 0
 
         while True:
