@@ -473,6 +473,144 @@ def test_warmup(cfg: dict, simulation_app):
     if "actor_loss" in metrics:
         check("actor_loss finite", torch.isfinite(torch.tensor(metrics["actor_loss"])).item())
 
+    # ═══════════════════════════════════════════════════════════════
+    # Phase 5: Online RL — run episodes with RLActorPolicy + trainer
+    # ═══════════════════════════════════════════════════════════════
+    print(f"\n{'=' * 60}")
+    print("Phase 5: Online RL (2 episodes with RLActorPolicy)")
+    print("=" * 60)
+
+    from scripts.utils.chunk_runner import RLActorPolicy, run_chunk_episodes
+
+    rl_policy = RLActorPolicy(
+        actor, vla_hook, stage1, device,
+        chunk_size, cfg["action_dim"],
+    )
+
+    buffer_before = len(replay)
+
+    # Collect trainer metrics across episodes
+    all_critic_losses = []
+    all_actor_losses = []
+
+    # Temp output dir for checkpoint test
+    import tempfile
+    test_output_dir = tempfile.mkdtemp(prefix="rlt_test_")
+
+    def test_save_fn(ep_num, reward, success):
+        ckpt_path = Path(test_output_dir) / f"episode_{ep_num}.pt"
+        torch.save({
+            "actor": actor.state_dict(),
+            "critic": critic.state_dict(),
+            "episode": ep_num,
+            "episode_reward": reward,
+        }, ckpt_path)
+
+    rl_cfg = dict(cfg)
+    rl_cfg["save_freq"] = 1  # save every episode for testing
+
+    stats = run_chunk_episodes(
+        env=env,
+        policy=rl_policy,
+        num_episodes=2,
+        cfg=rl_cfg,
+        args=args_namespace,
+        replay_buffer=replay,
+        garment_list=None,
+        rl_trainer=trainer,
+        save_fn=test_save_fn,
+    )
+
+    # ── Phase 5 Assertions ──
+    print(f"\n--- Phase 5 checks ---")
+
+    # 1. run_chunk_episodes returns stats
+    check("run_chunk_episodes returns list", isinstance(stats, list))
+    check("returns 2 episodes", len(stats) == 2, f"got {len(stats)}")
+
+    # 2. Each stat has expected keys
+    if len(stats) > 0:
+        expected_keys = {"reward", "steps", "success"}
+        check(
+            "stat keys correct",
+            expected_keys.issubset(set(stats[0].keys())),
+            f"got {set(stats[0].keys())}",
+        )
+
+    # 3. Episodes ran some steps
+    if len(stats) > 0:
+        check("episode steps > 0", stats[0]["steps"] > 0, f"got {stats[0]['steps']}")
+
+    # 4. Buffer grew (replay transitions from online episodes)
+    buffer_after = len(replay)
+    check(
+        "buffer grew from RL episodes",
+        buffer_after > buffer_before,
+        f"before={buffer_before}, after={buffer_after}",
+    )
+
+    # 5. Checkpoints were saved
+    ckpt_files = list(Path(test_output_dir).glob("episode_*.pt"))
+    check("checkpoint files saved", len(ckpt_files) >= 1, f"found {len(ckpt_files)}")
+
+    # 6. Checkpoint is loadable and has correct keys
+    if ckpt_files:
+        ckpt = torch.load(ckpt_files[0], map_location=device, weights_only=False)
+        check(
+            "checkpoint has actor state",
+            "actor" in ckpt,
+            f"keys: {list(ckpt.keys())}",
+        )
+        check("checkpoint has critic state", "critic" in ckpt)
+        check("checkpoint has episode num", "episode" in ckpt)
+        # Verify actor state_dict is loadable
+        actor_sd = ckpt["actor"]
+        check(
+            "actor state_dict valid",
+            isinstance(actor_sd, dict) and len(actor_sd) > 0,
+        )
+
+    # 7. Trainer step count increased (updates happened)
+    check(
+        "trainer updates occurred",
+        trainer.step_count > 0,
+        f"step_count = {trainer.step_count}",
+    )
+
+    # 8. Critic targets diverged from main (soft-updated at least once)
+    max_critic_target_diff = max(
+        (tp - p).abs().max().item()
+        for tp, p in zip(trainer.critic_target.parameters(), critic.parameters())
+    )
+    check(
+        "critic target diverged (soft update happened)",
+        max_critic_target_diff > 0,
+        f"max diff = {max_critic_target_diff:.8f}",
+    )
+
+    # 9. Buffer temporal consistency still holds after RL episodes
+    buf_len_now = len(replay)
+    dones_now = replay.done[:buf_len_now]
+    n_done_now = dones_now.sum().item()
+    check(
+        "done count == warmup + rl episodes",
+        n_done_now == cfg["warmup_episodes"] + 2,
+        f"expected {cfg['warmup_episodes'] + 2}, got {n_done_now}",
+    )
+
+    # 10. RL episode rewards are finite
+    if len(stats) > 0:
+        for i, s in enumerate(stats):
+            check(
+                f"ep {i+1} reward finite",
+                torch.isfinite(torch.tensor(s["reward"])).item(),
+                f"reward = {s['reward']}",
+            )
+
+    # Cleanup temp dir
+    import shutil
+    shutil.rmtree(test_output_dir, ignore_errors=True)
+
     # ── Summary ──
     print(f"\n{'=' * 60}")
     total = passed + failed
