@@ -480,12 +480,7 @@ def test_warmup(cfg: dict, simulation_app):
     print("Phase 5: Online RL (2 episodes with RLActorPolicy)")
     print("=" * 60)
 
-    from scripts.utils.chunk_runner import RLActorPolicy, run_chunk_episodes
-
-    rl_policy = RLActorPolicy(
-        actor, vla_hook, stage1, device,
-        chunk_size, cfg["action_dim"],
-    )
+    from scripts.utils.chunk_runner import run_rl_episodes
 
     buffer_before = len(replay)
 
@@ -508,17 +503,19 @@ def test_warmup(cfg: dict, simulation_app):
 
     rl_cfg = dict(cfg)
     rl_cfg["save_freq"] = 1  # save every episode for testing
+    rl_cfg["total_episodes"] = 2
 
-    stats = run_chunk_episodes(
+    stats = run_rl_episodes(
         env=env,
-        policy=rl_policy,
-        num_episodes=2,
+        actor=actor,
+        vla_hook=vla_hook,
+        stage1=stage1,
+        replay_buffer=replay,
+        rl_trainer=trainer,
         cfg=rl_cfg,
         args=args_namespace,
-        replay_buffer=replay,
-        garment_list=None,
-        rl_trainer=trainer,
         save_fn=test_save_fn,
+        garment_list=None,
     )
 
     # ── Phase 5 Assertions ──
