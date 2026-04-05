@@ -77,10 +77,17 @@ class ChunkResult:
 
 
 class BaseChunkPolicy(abc.ABC):
-    """Abstract base for chunk-level policies."""
+    """Abstract base for chunk-level policies.
+
+    Includes VLM output caching: get_state() caches (z_rl, a_tilde, s_p)
+    so the next get_chunk() can reuse them, avoiding a redundant VLM forward.
+    """
+
+    def __init__(self):
+        self._cached_vlm: Optional[tuple] = None  # (z_rl, a_tilde, s_p)
 
     def reset(self):
-        pass
+        self._cached_vlm = None
 
     @abc.abstractmethod
     def get_chunk(self, obs: dict) -> ChunkResult:
@@ -88,8 +95,14 @@ class BaseChunkPolicy(abc.ABC):
 
     @abc.abstractmethod
     def get_state(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        """Get (z_rl, s_p) without computing actions."""
+        """Get (z_rl, s_p) and cache VLM output for next get_chunk()."""
         pass
+
+    def _try_pop_cache(self):
+        """Pop cached VLM output. Returns None if cache empty."""
+        cache = self._cached_vlm
+        self._cached_vlm = None
+        return cache
 
     # ── Shared obs processing ──
 
@@ -139,6 +152,7 @@ class WarmupPolicy(BaseChunkPolicy):
     """VLA-only policy for warmup. Actions = VLA reference directly."""
 
     def __init__(self, vla_hook, stage1, normalizer, device, chunk_size):
+        super().__init__()
         self.vla_hook = vla_hook
         self.stage1 = stage1
         self.normalizer = normalizer
@@ -147,7 +161,11 @@ class WarmupPolicy(BaseChunkPolicy):
 
     @torch.no_grad()
     def get_chunk(self, obs: dict) -> ChunkResult:
-        z_rl, a_tilde, s_p = self._process_obs(obs)
+        cache = self._try_pop_cache()
+        if cache is not None:
+            z_rl, a_tilde, s_p = cache
+        else:
+            z_rl, a_tilde, s_p = self._process_obs(obs)
         action_chunk_norm = a_tilde[:, :self.chunk_size, :]
         action_raw = self.normalizer.denormalize_action(
             action_chunk_norm
@@ -159,8 +177,10 @@ class WarmupPolicy(BaseChunkPolicy):
             stored_action=action_chunk_norm.clone(),
         )
 
+    @torch.no_grad()
     def get_state(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        z_rl, _, s_p = self._process_obs(obs)
+        z_rl, a_tilde, s_p = self._process_obs(obs)
+        self._cached_vlm = (z_rl, a_tilde, s_p)  # Cache for next get_chunk
         return z_rl, s_p
 
 
@@ -173,6 +193,7 @@ class RLActorPolicy(BaseChunkPolicy):
     """RL actor policy with VLA reference conditioning."""
 
     def __init__(self, actor, vla_hook, stage1, normalizer, device, chunk_size, action_dim):
+        super().__init__()
         self.actor = actor
         self.vla_hook = vla_hook
         self.stage1 = stage1
@@ -182,30 +203,33 @@ class RLActorPolicy(BaseChunkPolicy):
         self.action_dim = action_dim
 
     @torch.no_grad()
-    def _get_vla_state(self, obs: dict):
-        """Get z_rl, a_tilde, s_p without actor (for get_state only)."""
-        return self._process_obs(obs)
-
     def get_chunk(self, obs: dict) -> ChunkResult:
-        with torch.no_grad():
+        # Check cache first (from previous get_state call on same obs)
+        cache = self._try_pop_cache()
+        if cache is not None:
+            z_rl, a_tilde, s_p = cache
+        else:
             z_rl, a_tilde, s_p = self._process_obs(obs)
 
-        # Actor forward with ref dropout (training mode)
+        # Actor forward under no_grad — experience collection, no backprop needed
+        # Dropout still active because actor.train() is set, just no gradient graph built
         self.actor.train()
         action_norm = self.actor(z_rl, s_p, a_tilde[:, :self.chunk_size, :])
         action_raw = self.normalizer.denormalize_action(
             action_norm.view(1, self.chunk_size, self.action_dim)
-        ).squeeze(0).detach().cpu().numpy()
+        ).squeeze(0).cpu().numpy()
 
         return ChunkResult(
             action_raw=action_raw,
-            z_rl=z_rl.detach(), s_p=s_p.detach(),
-            ref_action=a_tilde[:, :self.chunk_size, :].detach(),
-            stored_action=action_norm.detach().view(1, self.chunk_size, self.action_dim).clone(),
+            z_rl=z_rl, s_p=s_p,
+            ref_action=a_tilde[:, :self.chunk_size, :],
+            stored_action=action_norm.view(1, self.chunk_size, self.action_dim).clone(),
         )
 
+    @torch.no_grad()
     def get_state(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        z_rl, _, s_p = self._process_obs(obs)
+        z_rl, a_tilde, s_p = self._process_obs(obs)
+        self._cached_vlm = (z_rl, a_tilde, s_p)  # Cache for next get_chunk
         return z_rl, s_p
 
 
@@ -285,8 +309,8 @@ def run_chunk_episodes(
                 next_z_rl = torch.zeros(1, z_rl_dim, device=device)
                 next_s_p = torch.zeros(1, state_dim, device=device)
             else:
-                next_obs = env._get_observations()
-                next_z_rl, next_s_p = policy.get_state(next_obs)
+                obs = env._get_observations()  # Update obs once (reused by next get_chunk via cache)
+                next_z_rl, next_s_p = policy.get_state(obs)
 
             # ── Store transition ──
             if replay_buffer is not None:
@@ -313,7 +337,7 @@ def run_chunk_episodes(
             if done:
                 break
 
-            obs = env._get_observations()
+            # obs was already updated at line ~312 for get_state() — no extra _get_observations()
 
         # ── Episode summary (from eval pattern: evaluation.py:656) ──
         final_success = env._get_success()
