@@ -644,8 +644,10 @@ class MoESmolVLAPolicy(BasePolicy):
         original_lm_expert = self.base_policy.model.vlm_with_expert.lm_expert
         original_action_in_proj = self.base_policy.model.action_in_proj
         original_action_out_proj = self.base_policy.model.action_out_proj
-        original_action_time_mlp_in = self.base_policy.model.action_time_mlp_in
-        original_action_time_mlp_out = self.base_policy.model.action_time_mlp_out
+        # NOTE: action_time_mlp_in/out are NOT swapped per-expert.
+        # The base policy's time MLPs are shared across all experts (matches original working behavior).
+        # Swapping them caused regression — likely because they encode the flow matching
+        # timestep embedding which must stay consistent with the VLM backbone's KV cache.
 
         # Temporarily swap in expert components
         self.base_policy.model.vlm_with_expert.lm_expert = expert_components[
@@ -653,12 +655,6 @@ class MoESmolVLAPolicy(BasePolicy):
         ]
         self.base_policy.model.action_in_proj = expert_components["action_in_proj"]
         self.base_policy.model.action_out_proj = expert_components["action_out_proj"]
-        self.base_policy.model.action_time_mlp_in = expert_components[
-            "action_time_mlp_in"
-        ]
-        self.base_policy.model.action_time_mlp_out = expert_components[
-            "action_time_mlp_out"
-        ]
 
         # CRITICAL: Each expert was trained with different dataset stats.
         # We MUST use the expert's preprocessor/postprocessor for correct normalization.
@@ -714,12 +710,10 @@ class MoESmolVLAPolicy(BasePolicy):
             action_raw = batch_action_raw.squeeze(0).cpu().numpy()
 
         finally:
-            # Restore original components
+            # Restore original components (action_time_mlp NOT swapped — see note above)
             self.base_policy.model.vlm_with_expert.lm_expert = original_lm_expert
             self.base_policy.model.action_in_proj = original_action_in_proj
             self.base_policy.model.action_out_proj = original_action_out_proj
-            self.base_policy.model.action_time_mlp_in = original_action_time_mlp_in
-            self.base_policy.model.action_time_mlp_out = original_action_time_mlp_out
 
         if return_normalized:
             return action_raw, action_norm_np
