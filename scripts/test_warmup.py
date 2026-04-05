@@ -147,12 +147,12 @@ def test_warmup(cfg: dict, simulation_app):
     buf_len = len(replay)
     check("buffer has transitions", buf_len > 0, f"got {buf_len}")
 
-    # Expected: 50 steps / 10 chunk_size = 5 chunks (+1 if partial)
-    expected_chunks = cfg["max_episode_steps"] // chunk_size
+    # Expected: episodes * steps_per_episode / chunk_size
+    max_chunks = cfg["warmup_episodes"] * (cfg["max_episode_steps"] // chunk_size + 1)
     check(
         "buffer size reasonable",
-        0 < buf_len <= expected_chunks + 1,
-        f"expected ~{expected_chunks}, got {buf_len}",
+        0 < buf_len <= max_chunks,
+        f"expected <= {max_chunks}, got {buf_len}",
     )
 
     if buf_len > 0:
