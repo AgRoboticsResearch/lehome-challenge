@@ -48,7 +48,7 @@ bc_lr: 1.0e-3
 bc_loss_threshold: 0.01
 
 # ── Run (debug: reduced for faster iteration) ──
-max_episode_steps: 300          # 600 is too long for early-stage actor; 300 still generous
+max_episode_steps: 400          # MoE needs ~336 steps to succeed; 300 cuts it off too early
 total_episodes: 100             # 500 is slow for debugging; increase once reward improves
 batch_size: 256
 output_dir: outputs/rl_token/stage2
