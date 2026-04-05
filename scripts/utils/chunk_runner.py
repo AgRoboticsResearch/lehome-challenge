@@ -336,8 +336,7 @@ def run_chunk_episodes(
 
             if done:
                 break
-
-            # obs was already updated at line ~312 for get_state() — no extra _get_observations()
+            # obs already updated at line ~312 (env._get_observations + get_state cache)
 
         # ── Episode summary (from eval pattern: evaluation.py:656) ──
         final_success = env._get_success()
