@@ -41,9 +41,11 @@ class VLAStage2Hook:
         self.model = self.prefix_hook.model  # VLAFlowMatching, already frozen
         self.device = self.prefix_hook.device
 
-        # Load state normalization stats (same as eval pipeline's expert preprocessor)
+        # Load state and action normalization stats (same as eval pipeline's expert preprocessor)
         self.state_mean = None
         self.state_std = None
+        self.act_mean = None
+        self.act_std = None
         if dataset_stats_path:
             with open(dataset_stats_path) as f:
                 stats = json.load(f)
@@ -53,12 +55,36 @@ class VLAStage2Hook:
             self.state_std = torch.tensor(
                 stats["observation.state"]["std"], device=device
             )
+            self.act_mean = torch.tensor(
+                stats["action"]["mean"], device=device
+            )
+            self.act_std = torch.tensor(
+                stats["action"]["std"], device=device
+            )
 
-    def _normalize_state(self, state: torch.Tensor) -> torch.Tensor:
+    def normalize_state(self, state: torch.Tensor) -> torch.Tensor:
         """Normalize state: (x - mean) / std, matching eval preprocessor."""
         if self.state_mean is not None:
             return (state - self.state_mean) / self.state_std
         return state
+
+    def denormalize_state(self, state: torch.Tensor) -> torch.Tensor:
+        """Denormalize state: x * std + mean."""
+        if self.state_std is not None:
+            return state * self.state_std + self.state_mean
+        return state
+
+    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Normalize action: (a - mean) / std."""
+        if self.act_mean is not None:
+            return (action - self.act_mean) / self.act_std
+        return action
+
+    def denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Denormalize action: a * std + mean."""
+        if self.act_std is not None:
+            return action * self.act_std + self.act_mean
+        return action
 
     @torch.no_grad()
     def forward(
@@ -89,7 +115,7 @@ class VLAStage2Hook:
             raw_state = raw_state.float().to(self.device)
         else:
             raw_state = torch.as_tensor(raw_state, dtype=torch.float32, device=self.device)
-        state = self._normalize_state(raw_state)
+        state = self.normalize_state(raw_state)
         state = self.prefix_hook.prepare_state(state)
 
         B = state.shape[0]

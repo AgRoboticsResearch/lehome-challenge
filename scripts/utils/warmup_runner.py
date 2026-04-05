@@ -44,7 +44,7 @@ def _prepare_obs_batch(obs: dict, device: torch.device) -> dict:
 
 
 @torch.no_grad()
-def _compute_vla_state(obs, vla_hook, stage1, normalizer, device, chunk_size):
+def _compute_vla_state(obs, vla_hook, stage1, device, chunk_size):
     """obs -> (z_rl, ref_action, s_p) for replay buffer."""
     batch = _prepare_obs_batch(obs, device)
     z_vlm, a_tilde = vla_hook.forward(batch)
@@ -55,7 +55,7 @@ def _compute_vla_state(obs, vla_hook, stage1, normalizer, device, chunk_size):
     joint_pos = torch.as_tensor(
         obs["observation.state"], dtype=torch.float32, device=device
     ).unsqueeze(0)
-    s_p = normalizer.normalize_state(joint_pos)
+    s_p = vla_hook.normalize_state(joint_pos)
 
     ref_action = a_tilde[:, :chunk_size, :]
     return z_rl, ref_action, s_p
@@ -71,7 +71,6 @@ def run_warmup_episodes(
     moe_policy,
     vla_hook,
     stage1,
-    normalizer,
     replay_buffer,
     cfg: dict,
     args,
@@ -115,7 +114,7 @@ def run_warmup_episodes(
 
         # VLA state for first chunk
         z_rl, ref_action, s_p = _compute_vla_state(
-            obs, vla_hook, stage1, normalizer, device, chunk_size
+            obs, vla_hook, stage1, device, chunk_size
         )
 
         chunk_actions_raw = []  # denormalized MoE actions
@@ -185,14 +184,14 @@ def run_warmup_episodes(
                     next_ref_action = None
                 else:
                     next_z_rl, next_ref_action, next_s_p = _compute_vla_state(
-                        obs, vla_hook, stage1, normalizer, device, chunk_size
+                        obs, vla_hook, stage1, device, chunk_size
                     )
 
                 # Normalize executed actions for replay buffer
                 n_exec = len(chunk_actions_raw)
                 actions_np = np.stack(chunk_actions_raw)  # (n_exec, action_dim)
                 actions_tensor = torch.from_numpy(actions_np).float().to(device)
-                stored_action = normalizer.normalize_action(actions_tensor).unsqueeze(
+                stored_action = vla_hook.normalize_action(actions_tensor).unsqueeze(
                     0
                 )  # (1, n_exec, action_dim)
 

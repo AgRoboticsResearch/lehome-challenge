@@ -30,7 +30,6 @@ from lehome.models.rl_stage2 import (
     TwinCritic,
     RLTTrainer,
     ReplayBuffer,
-    SimpleNormalizer,
 )
 from lehome.models.rl_token import RLTokenStage1
 from lehome.models.vla_stage2_hook import VLAStage2Hook
@@ -71,8 +70,6 @@ def train(cfg: dict, simulation_app):
     print("Phase 1: Loading Frozen Components")
     print("=" * 60)
 
-    normalizer = SimpleNormalizer(cfg["dataset_stats_path"], device)
-
     vla_hook = VLAStage2Hook(
         pretrained_path=cfg["smolvla_pretrained_path"],
         device=str(device),
@@ -88,8 +85,7 @@ def train(cfg: dict, simulation_app):
         p.requires_grad = False
     stage1.to(device)
 
-    print(f"  Normalizer: {cfg['dataset_stats_path']}")
-    print(f"  VLA hook: {cfg['smolvla_pretrained_path']}")
+    print(f"  VLA hook: {cfg['smolvla_pretrained_path']} (includes normalization)")
     print(f"  Stage 1: {cfg['rl_token_stage1_path']}")
 
     # ── Phase 2: Create Trainable Components ──
@@ -197,7 +193,6 @@ def train(cfg: dict, simulation_app):
         moe_policy=moe_policy,
         vla_hook=vla_hook,
         stage1=stage1,
-        normalizer=normalizer,
         replay_buffer=replay,
         cfg=cfg,
         args=args_namespace,
@@ -247,7 +242,7 @@ def train(cfg: dict, simulation_app):
     best_reward = -float("inf")
 
     rl_policy = RLActorPolicy(
-        actor, vla_hook, stage1, normalizer, device,
+        actor, vla_hook, stage1, device,
         chunk_size, cfg["action_dim"],
     )
 

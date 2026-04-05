@@ -138,7 +138,7 @@ class BaseChunkPolicy(abc.ABC):
         joint_pos = torch.as_tensor(
             obs["observation.state"], dtype=torch.float32, device=self.device
         ).unsqueeze(0)
-        s_p = self.normalizer.normalize_state(joint_pos)
+        s_p = self.vla_hook.normalize_state(joint_pos)
 
         return z_rl, a_tilde, s_p
 
@@ -151,11 +151,10 @@ class BaseChunkPolicy(abc.ABC):
 class WarmupPolicy(BaseChunkPolicy):
     """VLA-only policy for warmup. Actions = VLA reference directly."""
 
-    def __init__(self, vla_hook, stage1, normalizer, device, chunk_size):
+    def __init__(self, vla_hook, stage1, device, chunk_size):
         super().__init__()
         self.vla_hook = vla_hook
         self.stage1 = stage1
-        self.normalizer = normalizer
         self.device = device
         self.chunk_size = chunk_size
 
@@ -167,7 +166,7 @@ class WarmupPolicy(BaseChunkPolicy):
         else:
             z_rl, a_tilde, s_p = self._process_obs(obs)
         action_chunk_norm = a_tilde[:, :self.chunk_size, :]
-        action_raw = self.normalizer.denormalize_action(
+        action_raw = self.vla_hook.denormalize_action(
             action_chunk_norm
         ).squeeze(0).cpu().numpy()
         return ChunkResult(
@@ -201,12 +200,11 @@ class DecoupledWarmupPolicy(BaseChunkPolicy):
     detection, etc.).
     """
 
-    def __init__(self, moe_policy, vla_hook, stage1, normalizer, device, chunk_size):
+    def __init__(self, moe_policy, vla_hook, stage1, device, chunk_size):
         super().__init__()
         self.moe_policy = moe_policy    # MoESmolVLAPolicy (eval pipeline)
         self.vla_hook = vla_hook
         self.stage1 = stage1
-        self.normalizer = normalizer
         self.device = device
         self.chunk_size = chunk_size
 
@@ -238,7 +236,7 @@ class DecoupledWarmupPolicy(BaseChunkPolicy):
 
         # stored_action: MoE actions converted to normalized space
         action_tensor = torch.from_numpy(action_raw).float().to(self.device)
-        stored_action = self.normalizer.normalize_action(action_tensor).unsqueeze(0)
+        stored_action = self.vla_hook.normalize_action(action_tensor).unsqueeze(0)
 
         return ChunkResult(
             action_raw=action_raw,
@@ -262,12 +260,11 @@ class DecoupledWarmupPolicy(BaseChunkPolicy):
 class RLActorPolicy(BaseChunkPolicy):
     """RL actor policy with VLA reference conditioning."""
 
-    def __init__(self, actor, vla_hook, stage1, normalizer, device, chunk_size, action_dim):
+    def __init__(self, actor, vla_hook, stage1, device, chunk_size, action_dim):
         super().__init__()
         self.actor = actor
         self.vla_hook = vla_hook
         self.stage1 = stage1
-        self.normalizer = normalizer
         self.device = device
         self.chunk_size = chunk_size
         self.action_dim = action_dim
@@ -285,7 +282,7 @@ class RLActorPolicy(BaseChunkPolicy):
         # Dropout still active because actor.train() is set, just no gradient graph built
         self.actor.train()
         action_norm = self.actor(z_rl, s_p, a_tilde[:, :self.chunk_size, :])
-        action_raw = self.normalizer.denormalize_action(
+        action_raw = self.vla_hook.denormalize_action(
             action_norm.view(1, self.chunk_size, self.action_dim)
         ).squeeze(0).cpu().numpy()
 

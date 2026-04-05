@@ -1,5 +1,5 @@
 """
-Stage 2 RL components: Normalizer, ReplayBuffer, Actor, Critic, Trainer.
+Stage 2 RL components: ReplayBuffer, Actor, Critic, Trainer.
 
 Implements TD3+BC (Twin Delayed Deep Deterministic Policy Gradient with BC regularization)
 for refining SmolVLA action chunks using RL Token state representation.
@@ -8,46 +8,12 @@ Paper: "RL Token: Bootstrapping Online RL with VLA Models" (Physical Intelligenc
 """
 
 import copy
-import json
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SimpleNormalizer — dataset stats only, no running stats
-# ═══════════════════════════════════════════════════════════════════
-
-
-class SimpleNormalizer:
-    """Normalizer using dataset stats.json only. No warmup, no running stats.
-
-    Stats source: Datasets/example/top_long_merged/meta/stats.json
-    Contains: observation.state (mean, std), action (mean, std)
-    """
-
-    def __init__(self, stats_path: str, device: torch.device):
-        with open(stats_path) as f:
-            stats = json.load(f)
-        self.pos_mean = torch.tensor(stats["observation.state"]["mean"], device=device)
-        self.pos_std = torch.tensor(stats["observation.state"]["std"], device=device)
-        self.act_mean = torch.tensor(stats["action"]["mean"], device=device)
-        self.act_std = torch.tensor(stats["action"]["std"], device=device)
-
-    def normalize_state(self, joint_pos: torch.Tensor) -> torch.Tensor:
-        return (joint_pos - self.pos_mean) / self.pos_std
-
-    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
-        return (action - self.act_mean) / self.act_std
-
-    def denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
-        return action * self.act_std + self.act_mean
-
-    def denormalize_state(self, state: torch.Tensor) -> torch.Tensor:
-        return state * self.pos_std + self.pos_mean
 
 
 # ═══════════════════════════════════════════════════════════════════

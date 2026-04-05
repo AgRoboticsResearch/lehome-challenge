@@ -43,13 +43,10 @@ def test_warmup(cfg: dict, simulation_app):
     print("=" * 60)
 
     from lehome.models.rl_stage2 import (
-        ReplayBuffer, SimpleNormalizer, RLActor, TwinCritic, RLTTrainer,
+        ReplayBuffer, RLActor, TwinCritic, RLTTrainer,
     )
     from lehome.models.rl_token import RLTokenStage1
     from lehome.models.vla_stage2_hook import VLAStage2Hook
-
-    normalizer = SimpleNormalizer(cfg["dataset_stats_path"], device)
-    print(f"  Normalizer: OK")
 
     vla_hook = VLAStage2Hook(
         pretrained_path=cfg["smolvla_pretrained_path"],
@@ -167,7 +164,6 @@ def test_warmup(cfg: dict, simulation_app):
         moe_policy=moe_policy,
         vla_hook=vla_hook,
         stage1=stage1,
-        normalizer=normalizer,
         replay_buffer=replay,
         cfg=cfg,
         args=args_namespace,
