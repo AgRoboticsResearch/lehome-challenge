@@ -11,7 +11,7 @@ Pipeline:
     Phase 4.5: BC pretrain — initialize actor to mimic VLA
     Phase 5:   Online RL — TD3+BC training loop
 
-Env interaction is handled by chunk_runner which reuses correct patterns
+Env interaction is handled by rl_online.py which reuses correct patterns
 from evaluation.py (env._get_rewards, env._get_success, stabilize, etc).
 """
 
@@ -33,7 +33,7 @@ from lehome.models.rl_stage2 import (
 )
 from lehome.models.rl_token import RLTokenStage1
 from lehome.models.vla_stage2_hook import VLAStage2Hook
-from scripts.utils.chunk_runner import run_rl_episodes
+from scripts.utils.rl_online import run_rl_episodes
 
 import yaml
 import os
@@ -227,7 +227,7 @@ def train(cfg: dict, simulation_app):
     trainer.sync_actor_target()
     print("  Actor target synced with BC-pretrained weights")
 
-    # ── Phase 5: Online RL (via chunk_runner) ──
+    # ── Phase 5: Online RL (via rl_online) ──
     print("\n" + "=" * 60)
     print(f"Phase 5: Online RL ({cfg['total_episodes']} episodes)")
     print("=" * 60)

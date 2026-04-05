@@ -480,7 +480,7 @@ def test_warmup(cfg: dict, simulation_app):
     print("Phase 5: Online RL (2 episodes with RLActorPolicy)")
     print("=" * 60)
 
-    from scripts.utils.chunk_runner import run_rl_episodes
+    from scripts.utils.rl_online import run_rl_episodes
 
     buffer_before = len(replay)
 
