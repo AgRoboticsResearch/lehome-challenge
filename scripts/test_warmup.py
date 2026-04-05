@@ -197,6 +197,123 @@ def test_warmup(cfg: dict, simulation_app):
         done_flags = sample["done"]
         check("done flag exists", done_flags is not None)
 
+    # ═══════════════════════════════════════════════════════════════
+    # Deep checks — sequential buffer analysis
+    # ═══════════════════════════════════════════════════════════════
+    print("\n--- Deep checks (sequential) ---")
+
+    # 1. Done flag structure: exactly cfg["warmup_episodes"] done=True entries
+    dones = replay.done[:buf_len]
+    n_done = dones.sum().item()
+    check(
+        "done count == episodes",
+        n_done == cfg["warmup_episodes"],
+        f"expected {cfg['warmup_episodes']}, got {n_done}",
+    )
+
+    # 2. Terminal transitions have zeroed next-state
+    done_indices = dones.nonzero(as_tuple=True)[0]
+    if len(done_indices) > 0:
+        next_z_at_done = replay.next_z_rl[done_indices]
+        next_s_at_done = replay.next_s_p[done_indices]
+        check(
+            "next_z_rl == 0 at done",
+            (next_z_at_done == 0).all().item(),
+            f"max abs = {next_z_at_done.abs().max().item():.6f}",
+        )
+        check(
+            "next_s_p == 0 at done",
+            (next_s_at_done == 0).all().item(),
+            f"max abs = {next_s_at_done.abs().max().item():.6f}",
+        )
+
+    # 3. Temporal consistency: next_z_rl[i] == z_rl[i+1] for non-done transitions
+    #    Episode boundaries break the chain, so we skip across done=True indices.
+    not_done_mask = ~dones
+    # For non-done transitions at index i, the next transition is i+1
+    # (only valid if i+1 < buf_len)
+    seq_valid = not_done_mask & torch.arange(buf_len, device=device).lt(buf_len - 1)
+    seq_idx = seq_valid.nonzero(as_tuple=True)[0]
+    if len(seq_idx) > 0:
+        z_mismatch = (
+            replay.next_z_rl[seq_idx] - replay.z_rl[seq_idx + 1]
+        ).abs().max().item()
+        check(
+            "temporal: next_z_rl[i] == z_rl[i+1]",
+            z_mismatch < 1e-4,
+            f"max abs diff = {z_mismatch:.6f}",
+        )
+
+        s_mismatch = (
+            replay.next_s_p[seq_idx] - replay.s_p[seq_idx + 1]
+        ).abs().max().item()
+        check(
+            "temporal: next_s_p[i] == s_p[i+1]",
+            s_mismatch < 1e-4,
+            f"max abs diff = {s_mismatch:.6f}",
+        )
+    else:
+        # Edge case: every transition is done (1 step episodes)
+        check("temporal: next_z_rl[i] == z_rl[i+1]", True, "skipped (no non-done pairs)")
+
+    # 4. Discount sanity: rewards should be positive and bounded
+    rewards = replay.reward[:buf_len]
+    check("rewards are non-negative", (rewards >= 0).all().item())
+
+    # Upper bound: max per-step reward * sum(gamma^t for t in chunk)
+    # If we assume max single-step reward ~1.0, max chunk return = sum(gamma^t)
+    gamma = cfg["gamma"]
+    max_chunk_return_theoretical = sum(gamma ** t for t in range(chunk_size))
+    # Use a generous bound (500) since real per-step rewards can be > 1.0
+    # Just check for no extreme outliers
+    max_reward = rewards.max().item()
+    check(
+        "rewards bounded (no extreme outliers)",
+        max_reward < 1000,
+        f"max reward = {max_reward:.3f}",
+    )
+
+    # 5. Partial chunk padding: for done=True transitions, check if action
+    #    tail is zero-padded (partial chunks). Full chunks will have non-zero
+    #    throughout, but the structure should still be valid.
+    if len(done_indices) > 0:
+        for di in done_indices[:3]:  # check first 3 done transitions
+            act = replay.action[di]  # (chunk_size, action_dim)
+            # Find if there's a zero-padding boundary
+            row_norms = act.norm(dim=1)  # (chunk_size,)
+            nonzero_mask = row_norms > 1e-6
+            if nonzero_mask.any() and not nonzero_mask.all():
+                # Partial chunk: nonzero rows followed by zero rows
+                first_zero = (~nonzero_mask).int().argmax().item()
+                # Everything after first_zero should be zero
+                tail_zero = (row_norms[first_zero:] < 1e-6).all().item()
+                check(
+                    f"padding monotone (done idx {di.item()})",
+                    tail_zero,
+                    f"first zero at step {first_zero}/{chunk_size}",
+                )
+            else:
+                # Full chunk or all-zero (shouldn't happen)
+                check(f"padding monotone (done idx {di.item()})", True, "full chunk, no padding")
+                break  # only need to check partial ones
+
+    # 6. ref_action finiteness (separate from action finiteness)
+    ref_actions = replay.ref_action[:buf_len]
+    check("ref_action finite", torch.isfinite(ref_actions).all().item())
+
+    # 7. next_z_rl finite for non-done transitions
+    non_done_next_z = replay.next_z_rl[:buf_len][not_done_mask]
+    if len(non_done_next_z) > 0:
+        check(
+            "next_z_rl finite (non-done)",
+            torch.isfinite(non_done_next_z).all().item(),
+        )
+        check(
+            "next_z_rl non-zero (non-done)",
+            (non_done_next_z.abs() > 0).any().item(),
+            "all zeros — VLA may not be producing output",
+        )
+
     # ── Summary ──
     print(f"\n{'=' * 60}")
     total = passed + failed
