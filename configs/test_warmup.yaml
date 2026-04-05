@@ -1,0 +1,35 @@
+# Smoke test for warmup_runner — minimal overrides on top of train_rl_stage2.yaml
+# Usage: python -m scripts.test_warmup --config configs/test_warmup.yaml
+
+# ── Frozen components (same as train_rl_stage2) ──
+smolvla_pretrained_path: outputs/moe_train/smolvla_moe_expert_top_long_no_st_proj/checkpoints/008000/pretrained_model
+rl_token_stage1_path: outputs/rl_token/stage1/checkpoints/step_10000/rl_token_stage1.pt
+dataset_stats_path: Datasets/example/top_long_merged/meta/stats.json
+task_description: "fold the garment"
+
+# ── Environment (CPU) ──
+task: LeHome-BiSO101-Direct-Garment-v2
+garment_name: Top_Long_Unseen_0
+garment_version: Release
+garment_cfg_base_path: Assets/objects/Challenge_Garment
+particle_cfg_path: source/lehome/lehome/tasks/bedroom/config_file/particle_garment_cfg.yaml
+
+# ── Architecture ──
+chunk_size: 10
+z_rl_dim: 960
+state_dim: 12
+action_dim: 12
+hidden_dim: 512
+num_layers: 3
+fixed_std: 0.0067
+ref_dropout: 0.5
+
+# ── Warmup (minimal for smoke test) ──
+warmup_episodes: 1
+max_episode_steps: 50
+gamma: 0.99
+
+# ── Device ──
+device: cuda
+env_device: cpu
+seed: 42

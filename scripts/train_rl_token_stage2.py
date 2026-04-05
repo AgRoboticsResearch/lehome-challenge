@@ -181,32 +181,28 @@ def train(cfg: dict, simulation_app):
     seen_garments = [g for g in all_garments if "Seen" in g]
     print(f"  Garment pool: {len(seen_garments)} seen + {len(all_garments) - len(seen_garments)} unseen = {len(all_garments)} total")
 
-    # ── Phase 4: Warmup (via chunk_runner) ──
+    # ── Phase 4: Warmup (step-by-step, mirroring evaluation.py) ──
     print("\n" + "=" * 60)
-    print(f"Phase 4: Warmup ({cfg['warmup_episodes']} episodes) [DECOUPLED DEBUG]")
+    print(f"Phase 4: Warmup ({cfg['warmup_episodes']} episodes)")
     print("=" * 60)
 
-    # Create MoE policy for action generation (same as eval pipeline)
     from scripts.eval_policy.moe_smolvla_policy import MoESmolVLAPolicy
+    from scripts.utils.warmup_runner import run_warmup_episodes
+
     moe_policy = MoESmolVLAPolicy(device=str(device))
-    print(f"  MoE policy loaded for decoupled warmup")
+    print(f"  MoE policy loaded (eval pipeline)")
 
-    warmup_policy = DecoupledWarmupPolicy(
-        moe_policy, vla_hook, stage1, normalizer, device, chunk_size
-    )
-
-    warmup_start = time.time()
-    run_chunk_episodes(
+    run_warmup_episodes(
         env=env,
-        policy=warmup_policy,
-        num_episodes=cfg["warmup_episodes"],
+        moe_policy=moe_policy,
+        vla_hook=vla_hook,
+        stage1=stage1,
+        normalizer=normalizer,
+        replay_buffer=replay,
         cfg=cfg,
         args=args_namespace,
-        replay_buffer=replay,
         garment_list=seen_garments,
     )
-    warmup_time = time.time() - warmup_start
-    print(f"  Warmup done: {len(replay)} transitions in {warmup_time:.1f}s")
 
     # ── Phase 4.5: BC Pretrain Actor ──
     print("\n" + "=" * 60)
