@@ -25,8 +25,8 @@ fixed_std: 0.0067
 ref_dropout: 0.5
 
 # ── Warmup (minimal for smoke test) ──
-warmup_episodes: 1
-max_episode_steps: 50
+warmup_episodes: 5
+max_episode_steps: 400
 gamma: 0.99
 
 # ── Device ──
