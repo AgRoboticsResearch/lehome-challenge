@@ -20,33 +20,6 @@ from scripts.utils.common import stabilize_garment_after_reset
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Expert normalization — single source of truth from expert checkpoint
-# ═══════════════════════════════════════════════════════════════════
-
-
-@dataclass
-class ExpertNorm:
-    """Lightweight normalization using expert's own stats.
-
-    Replaces SimpleNormalizer. Stats come from the expert's preprocessor
-    safetensors (the same stats used during expert training).
-
-    All operations are simple tensor math — no class inheritance needed.
-    """
-    state_mean: torch.Tensor   # (state_dim,)
-    state_std: torch.Tensor    # (state_dim,)
-    action_mean: torch.Tensor  # (action_dim,)
-    action_std: torch.Tensor   # (action_dim,)
-    eps: float = 1e-8
-
-    def normalize_state(self, state: torch.Tensor) -> torch.Tensor:
-        return (state - self.state_mean) / (self.state_std + self.eps)
-
-    def denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
-        return action * (self.action_std + self.eps) + self.action_mean
-
-
-# ═══════════════════════════════════════════════════════════════════
 # Low-level chunk execution — the core fix
 # ═══════════════════════════════════════════════════════════════════
 
@@ -154,15 +127,10 @@ class BaseChunkPolicy(abc.ABC):
         return batch
 
     @torch.no_grad()
-    def _process_obs(self, obs: dict, skip_ode: bool = False):
-        """obs → (z_rl, a_tilde, s_p). Reuses VLAStage2Hook + RLTokenStage1.
-
-        Args:
-            skip_ode: If True, skip ODE denoising. a_tilde=None. Saves ~30ms.
-                      Used when ref_action comes from MoE policy instead of VLA.
-        """
+    def _process_obs(self, obs: dict):
+        """obs → (z_rl, a_tilde, s_p). Reuses VLAStage2Hook + RLTokenStage1."""
         batch = self._prepare_batch(obs)
-        z_vlm, a_tilde = self.vla_hook.forward(batch, skip_ode=skip_ode)
+        z_vlm, a_tilde = self.vla_hook.forward(batch)
 
         z_target = self.stage1.apply_keep_mask(z_vlm)
         z_rl = self.stage1.encoder(z_target)
@@ -170,36 +138,9 @@ class BaseChunkPolicy(abc.ABC):
         joint_pos = torch.as_tensor(
             obs["observation.state"], dtype=torch.float32, device=self.device
         ).unsqueeze(0)
-        s_p = self.expert_norm.normalize_state(joint_pos)
+        s_p = self.normalizer.normalize_state(joint_pos)
 
         return z_rl, a_tilde, s_p
-
-    def _get_moe_ref(self, obs: dict) -> tuple[np.ndarray, torch.Tensor]:
-        """Get chunk of actions from MoE policy with expert-normalized ref.
-
-        Uses select_action_dual() to get BOTH:
-          - raw actions (for env.step)
-          - expert-normalized actions (for replay buffer ref_action)
-
-        This avoids the normalization mismatch of re-normalizing raw actions
-        with SimpleNormalizer when expert stats differ.
-
-        Returns:
-            action_raw: (chunk_size, action_dim) numpy — raw joint space, for env.step()
-            ref_norm:   (1, chunk_size, action_dim) tensor — expert-normalized, for replay buffer
-        """
-        raw_actions = []
-        norm_actions = []
-        for _ in range(self.chunk_size):
-            action_raw, action_norm = self.moe_policy.select_action_dual(obs)
-            raw_actions.append(action_raw.copy())
-            norm_actions.append(action_norm.copy())
-        action_raw = np.stack(raw_actions)
-        action_norm_np = np.stack(norm_actions)
-
-        ref_norm = torch.from_numpy(action_norm_np).float().to(self.device).unsqueeze(0)
-
-        return action_raw, ref_norm
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -210,11 +151,11 @@ class BaseChunkPolicy(abc.ABC):
 class WarmupPolicy(BaseChunkPolicy):
     """VLA-only policy for warmup. Actions = VLA reference directly."""
 
-    def __init__(self, vla_hook, stage1, expert_norm, device, chunk_size):
+    def __init__(self, vla_hook, stage1, normalizer, device, chunk_size):
         super().__init__()
         self.vla_hook = vla_hook
         self.stage1 = stage1
-        self.expert_norm = expert_norm
+        self.normalizer = normalizer
         self.device = device
         self.chunk_size = chunk_size
 
@@ -226,7 +167,7 @@ class WarmupPolicy(BaseChunkPolicy):
         else:
             z_rl, a_tilde, s_p = self._process_obs(obs)
         action_chunk_norm = a_tilde[:, :self.chunk_size, :]
-        action_raw = self.expert_norm.denormalize_action(
+        action_raw = self.normalizer.denormalize_action(
             action_chunk_norm
         ).squeeze(0).cpu().numpy()
         return ChunkResult(
@@ -260,12 +201,12 @@ class DecoupledWarmupPolicy(BaseChunkPolicy):
     detection, etc.).
     """
 
-    def __init__(self, moe_policy, vla_hook, stage1, expert_norm, device, chunk_size):
+    def __init__(self, moe_policy, vla_hook, stage1, normalizer, device, chunk_size):
         super().__init__()
         self.moe_policy = moe_policy    # MoESmolVLAPolicy (eval pipeline)
         self.vla_hook = vla_hook
         self.stage1 = stage1
-        self.expert_norm = expert_norm
+        self.normalizer = normalizer
         self.device = device
         self.chunk_size = chunk_size
 
@@ -275,28 +216,41 @@ class DecoupledWarmupPolicy(BaseChunkPolicy):
 
     @torch.no_grad()
     def get_chunk(self, obs: dict) -> ChunkResult:
-        # ── z_rl path: VLAStage2Hook (skip ODE — ref comes from MoE) ──
+        # ── z_rl path: VLAStage2Hook (unchanged from WarmupPolicy) ──
         cache = self._try_pop_cache()
         if cache is not None:
-            z_rl, _, s_p = cache
+            z_rl, a_tilde, s_p = cache
         else:
-            z_rl, _, s_p = self._process_obs(obs, skip_ode=True)
+            z_rl, a_tilde, s_p = self._process_obs(obs)
 
-        # ── Action + ref path: MoE policy (same as eval!) ──
-        action_raw, ref_action = self._get_moe_ref(obs)
+        # ── Action path: MoE policy (same as eval!) ──
+        # MoE policy has internal action queue (n_action_steps=12).
+        # Calling select_action chunk_size times drains the queue.
+        # First call triggers VLM forward; subsequent calls pop from queue.
+        actions = []
+        for _ in range(self.chunk_size):
+            action_np = self.moe_policy.select_action(obs)
+            actions.append(action_np.copy())
+        action_raw = np.stack(actions)  # (chunk_size, action_dim)
 
-        # stored_action = ref_action (MoE actions in normalized space)
+        # ref_action from VLA hook (normalized) — for replay buffer
+        ref_action = a_tilde[:, :self.chunk_size, :]
+
+        # stored_action: MoE actions converted to normalized space
+        action_tensor = torch.from_numpy(action_raw).float().to(self.device)
+        stored_action = self.normalizer.normalize_action(action_tensor).unsqueeze(0)
+
         return ChunkResult(
             action_raw=action_raw,
             z_rl=z_rl, s_p=s_p,
             ref_action=ref_action,
-            stored_action=ref_action.clone(),
+            stored_action=stored_action,
         )
 
     @torch.no_grad()
     def get_state(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        z_rl, _, s_p = self._process_obs(obs, skip_ode=True)
-        self._cached_vlm = (z_rl, None, s_p)
+        z_rl, a_tilde, s_p = self._process_obs(obs)
+        self._cached_vlm = (z_rl, a_tilde, s_p)
         return z_rl, s_p
 
 
@@ -306,57 +260,46 @@ class DecoupledWarmupPolicy(BaseChunkPolicy):
 
 
 class RLActorPolicy(BaseChunkPolicy):
-    """RL actor policy with MoE reference conditioning.
+    """RL actor policy with VLA reference conditioning."""
 
-    ref_action comes from MoE policy (not VLAHook's a_tilde, which has zero success).
-    VLAHook only produces z_rl (skip_ode=True, saves ~30ms/chunk).
-    """
-
-    def __init__(self, actor, moe_policy, vla_hook, stage1, expert_norm, device, chunk_size, action_dim):
+    def __init__(self, actor, vla_hook, stage1, normalizer, device, chunk_size, action_dim):
         super().__init__()
         self.actor = actor
-        self.moe_policy = moe_policy
         self.vla_hook = vla_hook
         self.stage1 = stage1
-        self.expert_norm = expert_norm
+        self.normalizer = normalizer
         self.device = device
         self.chunk_size = chunk_size
         self.action_dim = action_dim
 
-    def reset(self):
-        super().reset()
-        self.moe_policy.reset()
-
     @torch.no_grad()
     def get_chunk(self, obs: dict) -> ChunkResult:
-        # ── z_rl path: VLAHook (skip ODE, only z_vlm → z_rl) ──
+        # Check cache first (from previous get_state call on same obs)
         cache = self._try_pop_cache()
         if cache is not None:
-            z_rl, _, s_p = cache
+            z_rl, a_tilde, s_p = cache
         else:
-            z_rl, _, s_p = self._process_obs(obs, skip_ode=True)
+            z_rl, a_tilde, s_p = self._process_obs(obs)
 
-        # ── ref_action path: MoE policy ──
-        _, ref_action = self._get_moe_ref(obs)
-
-        # ── Actor forward (with MoE ref as conditioning, 50% dropout inside actor) ──
+        # Actor forward under no_grad — experience collection, no backprop needed
+        # Dropout still active because actor.train() is set, just no gradient graph built
         self.actor.train()
-        action_norm = self.actor(z_rl, s_p, ref_action)
-        action_raw = self.expert_norm.denormalize_action(
+        action_norm = self.actor(z_rl, s_p, a_tilde[:, :self.chunk_size, :])
+        action_raw = self.normalizer.denormalize_action(
             action_norm.view(1, self.chunk_size, self.action_dim)
         ).squeeze(0).cpu().numpy()
 
         return ChunkResult(
             action_raw=action_raw,
             z_rl=z_rl, s_p=s_p,
-            ref_action=ref_action,
+            ref_action=a_tilde[:, :self.chunk_size, :],
             stored_action=action_norm.view(1, self.chunk_size, self.action_dim).clone(),
         )
 
     @torch.no_grad()
     def get_state(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        z_rl, _, s_p = self._process_obs(obs, skip_ode=True)
-        self._cached_vlm = (z_rl, None, s_p)
+        z_rl, a_tilde, s_p = self._process_obs(obs)
+        self._cached_vlm = (z_rl, a_tilde, s_p)  # Cache for next get_chunk
         return z_rl, s_p
 
 
@@ -414,7 +357,6 @@ def run_chunk_episodes(
         episode_reward = 0
         episode_steps = 0
         episode_metrics = {"critic_loss": [], "actor_loss": [], "bc_loss": []} if rl_trainer else {}
-        success_flag = False  # Latch success across chunks (like eval's success_flag)
 
         while episode_steps < max_steps:
             # ── Policy decides action chunk ──
@@ -426,10 +368,6 @@ def run_chunk_episodes(
             chunk_return = sum(gamma ** t * r for t, r in enumerate(rewards))
             episode_reward += sum(rewards)
             episode_steps += n_exec
-
-            # Latch success — garment may shift after initial success (matches eval.py:372-375)
-            if success:
-                success_flag = True
 
             # Handle partial chunk execution
             stored = chunk.stored_action.clone()
@@ -471,9 +409,8 @@ def run_chunk_episodes(
             # obs already updated at line ~312 (env._get_observations + get_state cache)
 
         # ── Episode summary (from eval pattern: evaluation.py:656) ──
-        # Use latched success_flag (not transient _get_success) — matches eval.py:473
         final_success = env._get_success()
-        is_success = success_flag or (final_success.item() if torch.is_tensor(final_success) else bool(final_success))
+        is_success = final_success.item() if torch.is_tensor(final_success) else bool(final_success)
         avg_r = episode_reward / max(episode_steps, 1)
 
         stat = {
