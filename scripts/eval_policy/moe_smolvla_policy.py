@@ -451,6 +451,36 @@ class MoESmolVLAPolicy(BasePolicy):
         # === 使用锁定的Expert（不再调用Router）===
         return self._select_action_with_expert(observation_dict, self._locked_expert)
 
+    def select_action_dual(
+        self, observation: Dict[str, np.ndarray]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Generate action returning BOTH raw (for env) and expert-normalized (for RL ref).
+
+        Same as select_action() but also returns the action in expert-normalized space
+        BEFORE the postprocessor denormalizes it. This avoids the normalization mismatch
+        that would occur if we re-normalized raw actions with SimpleNormalizer.
+
+        Returns:
+            action_raw:  Joint actions [12] in raw joint space (for env.step)
+            action_norm: Joint actions [12] in expert-normalized space (for ref_action)
+        """
+        observation_dict = self._prepare_observation(observation)
+
+        # Sticky Routing (same as select_action)
+        if self._locked_expert is None:
+            image = observation_dict["observation.images.top_rgb"]
+            garment_type, confidence = self._route_image(image)
+            self._locked_expert = garment_type
+            self.selected_expert = garment_type
+            logger.info(
+                f"🔒 Sticky Routing: Locked Expert {garment_type} (confidence: {confidence:.3f})"
+            )
+
+        return self._select_action_with_expert(
+            observation_dict, self._locked_expert, return_normalized=True
+        )
+
     def _prepare_observation(
         self, observation: Dict[str, np.ndarray]
     ) -> Dict[str, np.ndarray]:
@@ -551,12 +581,23 @@ class MoESmolVLAPolicy(BasePolicy):
             return garment_type, confidence
 
     def _select_action_with_expert(
-        self, observation_dict: Dict[str, np.ndarray], garment_type: str
-    ) -> np.ndarray:
+        self, observation_dict: Dict[str, np.ndarray], garment_type: str,
+        return_normalized: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         """Select action using the specified expert.
 
         Uses expert-specific preprocessor/postprocessor for correct normalization,
         and swaps in the expert's lm_expert, action projections, and action_time_mlp.
+
+        Args:
+            observation_dict: Preprocessed observation dict
+            garment_type: Which expert to use
+            return_normalized: If True, also return action in expert-normalized space
+                              (before postprocessor denormalization). Used for RL ref_action.
+
+        Returns:
+            action: Raw action [12] for env.step()
+            If return_normalized: also returns action_norm [12] in expert-normalized space
         """
         if garment_type not in self.experts:
             raise ValueError(f"Expert for {garment_type} not available!")
@@ -623,13 +664,18 @@ class MoESmolVLAPolicy(BasePolicy):
                     observation_dict, expert_preprocessor
                 )
 
-                batch_action = self.base_policy.select_action(batch_obs)
+                batch_action_norm = self.base_policy.select_action(batch_obs)
+
+                # Capture expert-normalized action BEFORE postprocessor (for RL ref)
+                action_norm_np = None
+                if return_normalized:
+                    action_norm_np = batch_action_norm.squeeze(0).cpu().numpy()
 
                 # Always use expert's postprocessor (validated above)
-                batch_action = expert_postprocessor(batch_action)
+                batch_action_raw = expert_postprocessor(batch_action_norm)
 
             # Convert to numpy
-            action = batch_action.squeeze(0).cpu().numpy()
+            action_raw = batch_action_raw.squeeze(0).cpu().numpy()
 
         finally:
             # Restore original components
@@ -639,7 +685,9 @@ class MoESmolVLAPolicy(BasePolicy):
             self.base_policy.model.action_time_mlp_in = original_action_time_mlp_in
             self.base_policy.model.action_time_mlp_out = original_action_time_mlp_out
 
-        return action
+        if return_normalized:
+            return action_raw, action_norm_np
+        return action_raw
 
     def _prepare_batch_with_preprocessor(
         self, obs_dict: Dict[str, np.ndarray], preprocessor

@@ -148,20 +148,29 @@ class BaseChunkPolicy(abc.ABC):
         return z_rl, a_tilde, s_p
 
     def _get_moe_ref(self, obs: dict) -> tuple[np.ndarray, torch.Tensor]:
-        """Get chunk of actions from MoE policy and normalize for ref_action.
+        """Get chunk of actions from MoE policy with expert-normalized ref.
+
+        Uses select_action_dual() to get BOTH:
+          - raw actions (for env.step)
+          - expert-normalized actions (for replay buffer ref_action)
+
+        This avoids the normalization mismatch of re-normalizing raw actions
+        with SimpleNormalizer when expert stats differ.
 
         Returns:
             action_raw: (chunk_size, action_dim) numpy — raw joint space, for env.step()
-            ref_norm:   (1, chunk_size, action_dim) tensor — normalized, for replay buffer
+            ref_norm:   (1, chunk_size, action_dim) tensor — expert-normalized, for replay buffer
         """
-        actions = []
+        raw_actions = []
+        norm_actions = []
         for _ in range(self.chunk_size):
-            action_np = self.moe_policy.select_action(obs)
-            actions.append(action_np.copy())
-        action_raw = np.stack(actions)
+            action_raw, action_norm = self.moe_policy.select_action_dual(obs)
+            raw_actions.append(action_raw.copy())
+            norm_actions.append(action_norm.copy())
+        action_raw = np.stack(raw_actions)
+        action_norm_np = np.stack(norm_actions)
 
-        action_tensor = torch.from_numpy(action_raw).float().to(self.device)
-        ref_norm = self.normalizer.normalize_action(action_tensor).unsqueeze(0)
+        ref_norm = torch.from_numpy(action_norm_np).float().to(self.device).unsqueeze(0)
 
         return action_raw, ref_norm
 
