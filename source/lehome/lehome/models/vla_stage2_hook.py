@@ -106,14 +106,16 @@ class VLAStage2Hook:
         position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         # ── Phase 2: VLM forward — z_vlm only when skip_ode ──
-        use_cache = not skip_ode  # No need for KV cache if skipping ODE
+        # fill_kv_cache=True forces self-attn path (safe with inputs_embeds[1]=None).
+        # Without it, cross-attn mode hits inputs_embeds[1] which is None → AttributeError.
+        # When skip_ode=True, we still set use_cache=False so the KV cache is discarded.
         outputs_embeds, past_key_values = self.model.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
-            use_cache=use_cache,
-            fill_kv_cache=use_cache,
+            use_cache=not skip_ode,
+            fill_kv_cache=True,
         )
         z_vlm = outputs_embeds[0]  # (B, ~196, 960)
 
