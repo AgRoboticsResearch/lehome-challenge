@@ -689,7 +689,7 @@ class MoESmolVLAPolicy(BasePolicy):
                 f"Check if 'policy_postprocessor.json' exists in the expert checkpoint."
             )
 
-        logger.info(
+        logger.debug(
             f"✅ [{garment_type}] Using expert preprocessor/postprocessor with correct normalization stats"
         )
 

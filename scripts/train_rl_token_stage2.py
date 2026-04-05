@@ -43,10 +43,14 @@ from scripts.utils.chunk_runner import (
 
 import yaml
 import os
+import logging
 
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLEL", "1")
+
+# Suppress noisy draccus config parsing (fires for every SmolVLA config field)
+logging.getLogger("draccus").setLevel(logging.WARNING)
 
 
 # ═══════════════════════════════════════════════════════════════════

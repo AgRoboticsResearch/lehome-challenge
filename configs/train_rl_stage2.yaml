@@ -39,7 +39,7 @@ update_to_data_ratio: 5
 replay_capacity: 100000
 
 # ── Warmup ──
-warmup_episodes: 20
+warmup_episodes: 10             # 20 is overkill for debug; 10 still fills ~6K steps
 
 # ── BC Pretrain ──
 bc_pretrain_epochs: 100
@@ -47,12 +47,12 @@ bc_batches_per_epoch: 100
 bc_lr: 1.0e-3
 bc_loss_threshold: 0.01
 
-# ── Run ──
-max_episode_steps: 600          # VLA needs ~336 steps to succeed, give enough room
-total_episodes: 500
+# ── Run (debug: reduced for faster iteration) ──
+max_episode_steps: 300          # 600 is too long for early-stage actor; 300 still generous
+total_episodes: 100             # 500 is slow for debugging; increase once reward improves
 batch_size: 256
 output_dir: outputs/rl_token/stage2
-save_freq: 50
+save_freq: 20                   # checkpoint more often for debug inspection
 device: cuda
 env_device: cpu
 seed: 42
