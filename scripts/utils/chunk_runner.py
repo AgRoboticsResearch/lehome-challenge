@@ -405,6 +405,14 @@ def run_chunk_episodes(
                 break
             # obs already updated at line ~312 (env._get_observations + get_state cache)
 
+        # ── Timeout: mark last transition as done if loop exited without it ──
+        if not done and replay_buffer is not None and replay_buffer.size > 0:
+            # Patch the last stored transition: done=True, next state = zeros
+            last_idx = (replay_buffer.ptr - 1) % replay_buffer.capacity
+            replay_buffer.done[last_idx] = True
+            replay_buffer.next_z_rl[last_idx] = 0
+            replay_buffer.next_s_p[last_idx] = 0
+
         # ── Episode summary (from eval pattern: evaluation.py:656) ──
         final_success = env._get_success()
         is_success = final_success.item() if torch.is_tensor(final_success) else bool(final_success)
