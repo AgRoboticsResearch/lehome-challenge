@@ -185,7 +185,6 @@ def train(cfg: dict, simulation_app):
     # Create MoE policy for action generation (same as eval pipeline)
     from scripts.eval_policy.moe_smolvla_policy import MoESmolVLAPolicy
     moe_policy = MoESmolVLAPolicy(device=str(device))
-    moe_policy.eval()
     print(f"  MoE policy loaded for decoupled warmup")
 
     warmup_policy = DecoupledWarmupPolicy(
