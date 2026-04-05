@@ -36,6 +36,7 @@ from lehome.models.rl_token import RLTokenStage1
 from lehome.models.vla_stage2_hook import VLAStage2Hook
 from scripts.utils.chunk_runner import (
     WarmupPolicy,
+    DecoupledWarmupPolicy,
     RLActorPolicy,
     run_chunk_episodes,
 )
@@ -178,10 +179,18 @@ def train(cfg: dict, simulation_app):
 
     # ── Phase 4: Warmup (via chunk_runner) ──
     print("\n" + "=" * 60)
-    print(f"Phase 4: Warmup ({cfg['warmup_episodes']} episodes)")
+    print(f"Phase 4: Warmup ({cfg['warmup_episodes']} episodes) [DECOUPLED DEBUG]")
     print("=" * 60)
 
-    warmup_policy = WarmupPolicy(vla_hook, stage1, normalizer, device, chunk_size)
+    # Create MoE policy for action generation (same as eval pipeline)
+    from scripts.eval_policy.moe_smolvla_policy import MoESmolVLAPolicy
+    moe_policy = MoESmolVLAPolicy(device=str(device))
+    moe_policy.eval()
+    print(f"  MoE policy loaded for decoupled warmup")
+
+    warmup_policy = DecoupledWarmupPolicy(
+        moe_policy, vla_hook, stage1, normalizer, device, chunk_size
+    )
 
     warmup_start = time.time()
     run_chunk_episodes(

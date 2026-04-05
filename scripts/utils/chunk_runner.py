@@ -185,6 +185,76 @@ class WarmupPolicy(BaseChunkPolicy):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# DecoupledWarmupPolicy — debug: MoE for actions, VLA hook for z_rl
+# ═══════════════════════════════════════════════════════════════════
+
+
+class DecoupledWarmupPolicy(BaseChunkPolicy):
+    """Debug warmup policy that decouples action generation from z_rl computation.
+
+    Action path: Uses MoESmolVLAPolicy.select_action() (identical to eval pipeline).
+    z_rl path:   Uses VLAStage2Hook + RLTokenStage1 (for replay buffer).
+
+    Purpose: Isolate whether VLAStage2Hook's action generation causes zero success.
+    If this policy succeeds but WarmupPolicy doesn't, the VLAStage2Hook action
+    generation is broken. If both fail, the problem is elsewhere (env, success
+    detection, etc.).
+    """
+
+    def __init__(self, moe_policy, vla_hook, stage1, normalizer, device, chunk_size):
+        super().__init__()
+        self.moe_policy = moe_policy    # MoESmolVLAPolicy (eval pipeline)
+        self.vla_hook = vla_hook
+        self.stage1 = stage1
+        self.normalizer = normalizer
+        self.device = device
+        self.chunk_size = chunk_size
+
+    def reset(self):
+        super().reset()
+        self.moe_policy.reset()
+
+    @torch.no_grad()
+    def get_chunk(self, obs: dict) -> ChunkResult:
+        # ── z_rl path: VLAStage2Hook (unchanged from WarmupPolicy) ──
+        cache = self._try_pop_cache()
+        if cache is not None:
+            z_rl, a_tilde, s_p = cache
+        else:
+            z_rl, a_tilde, s_p = self._process_obs(obs)
+
+        # ── Action path: MoE policy (same as eval!) ──
+        # MoE policy has internal action queue (n_action_steps=12).
+        # Calling select_action chunk_size times drains the queue.
+        # First call triggers VLM forward; subsequent calls pop from queue.
+        actions = []
+        for _ in range(self.chunk_size):
+            action_np = self.moe_policy.select_action(obs)
+            actions.append(action_np.copy())
+        action_raw = np.stack(actions)  # (chunk_size, action_dim)
+
+        # ref_action from VLA hook (normalized) — for replay buffer
+        ref_action = a_tilde[:, :self.chunk_size, :]
+
+        # stored_action: MoE actions converted to normalized space
+        action_tensor = torch.from_numpy(action_raw).float().to(self.device)
+        stored_action = self.normalizer.normalize_action(action_tensor).unsqueeze(0)
+
+        return ChunkResult(
+            action_raw=action_raw,
+            z_rl=z_rl, s_p=s_p,
+            ref_action=ref_action,
+            stored_action=stored_action,
+        )
+
+    @torch.no_grad()
+    def get_state(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        z_rl, a_tilde, s_p = self._process_obs(obs)
+        self._cached_vlm = (z_rl, a_tilde, s_p)
+        return z_rl, s_p
+
+
+# ═══════════════════════════════════════════════════════════════════
 # RLActorPolicy — actor + VLA reference (Phase 5)
 # ═══════════════════════════════════════════════════════════════════
 
