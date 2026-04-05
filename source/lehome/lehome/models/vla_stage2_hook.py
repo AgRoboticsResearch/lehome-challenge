@@ -64,17 +64,21 @@ class VLAStage2Hook:
     def forward(
         self,
         obs_dict: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        skip_ode: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
-        Single VLM forward pass producing both z_vlm and the VLA action chunk.
+        Single VLM forward pass producing z_vlm and optionally the VLA action chunk.
 
         Args:
             obs_dict: Dict with image keys (observation.images.*_rgb) and
                       "observation.state" (joint positions, RAW or normalized).
+            skip_ode: If True, skip ODE denoising and return a_tilde=None.
+                      Saves ~30ms per chunk. Used when ref_action comes from MoE policy.
 
         Returns:
             z_vlm:   (B, prefix_len, hidden_size) — VLM prefix hidden states for RL Token Encoder.
             a_tilde: (B, chunk_size, action_dim)  — VLA reference action chunk (normalized space).
+                     None if skip_ode=True.
         """
         # ── Phase 1: Prepare + embed prefix (same as VLAPrefixHook.extract_prefix) ──
         images, img_masks = self.prefix_hook.prepare_images(obs_dict)
@@ -101,16 +105,20 @@ class VLAStage2Hook:
         att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # ── Phase 2: Single VLM forward — capture BOTH z_vlm and KV cache ──
+        # ── Phase 2: VLM forward — z_vlm only when skip_ode ──
+        use_cache = not skip_ode  # No need for KV cache if skipping ODE
         outputs_embeds, past_key_values = self.model.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-            fill_kv_cache=True,
+            use_cache=use_cache,
+            fill_kv_cache=use_cache,
         )
         z_vlm = outputs_embeds[0]  # (B, ~196, 960)
+
+        if skip_ode:
+            return z_vlm, None
 
         # ── Phase 3: ODE denoising using cached KV (no re-encoding) ──
         chunk_size = self.model.config.chunk_size  # 50
