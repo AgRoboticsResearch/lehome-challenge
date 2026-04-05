@@ -357,6 +357,7 @@ def run_chunk_episodes(
         episode_reward = 0
         episode_steps = 0
         episode_metrics = {"critic_loss": [], "actor_loss": [], "bc_loss": []} if rl_trainer else {}
+        success_flag = False  # Latch success across chunks (like eval's success_flag)
 
         while episode_steps < max_steps:
             # ── Policy decides action chunk ──
@@ -368,6 +369,10 @@ def run_chunk_episodes(
             chunk_return = sum(gamma ** t * r for t, r in enumerate(rewards))
             episode_reward += sum(rewards)
             episode_steps += n_exec
+
+            # Latch success — garment may shift after initial success (matches eval.py:372-375)
+            if success:
+                success_flag = True
 
             # Handle partial chunk execution
             stored = chunk.stored_action.clone()
@@ -409,8 +414,9 @@ def run_chunk_episodes(
             # obs already updated at line ~312 (env._get_observations + get_state cache)
 
         # ── Episode summary (from eval pattern: evaluation.py:656) ──
+        # Use latched success_flag (not transient _get_success) — matches eval.py:473
         final_success = env._get_success()
-        is_success = final_success.item() if torch.is_tensor(final_success) else bool(final_success)
+        is_success = success_flag or (final_success.item() if torch.is_tensor(final_success) else bool(final_success))
         avg_r = episode_reward / max(episode_steps, 1)
 
         stat = {
