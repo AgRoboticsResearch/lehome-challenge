@@ -23,6 +23,8 @@ Stage 1 (offline, already implemented) trains an RL Token Encoder/Decoder to com
 | **Normalization** | **Dataset stats only** | joint_pos/action 用 dataset stats.json；z_rl 不归一化（已由 Stage 1 控制） |
 | **Actor 初始化** | **BC pretrain from warmup data** | 从 VLA 行为克隆开始，避免 random actor 产生垃圾数据 |
 | **VLA 集成** | **VLAStage2Hook（共享 KV Cache）** | 一次 VLM forward 同时产出 z_vlm 和 ã，避免重复计算，每 chunk 省 ~60ms |
+| **Warmup 动作来源** | **DecoupledWarmupPolicy: MoE 选动作，VLAHook 只算 z_rl** | VLAStage2Hook 的 ã 质量差（zero success），用 eval 管线的 MoE policy 生成动作保证 warmup 质量；z_rl / ref_action 仍由 VLAHook 提供（replay buffer 需要） |
+| **Success 检测** | **Latch across chunks** | `_get_success()` 是瞬时的（garment 可能在成功后移位），用 `success_flag` 锁存首次成功（matches eval.py:372-375） |
 | **next_z_rl** | **延迟一拍存储** | 用当前 chunk 的 z_rl 作为上一条 transition 的 next_z_rl，每 chunk 只需一次 VLA forward |
 | **Garment 范围** | **单 garment** | 先只支持单 garment 类型（如 top_long），后续再扩展 |
 
@@ -565,26 +567,43 @@ def train(cfg):
     env = create_isaac_env(cfg)  # CPU
 
     # Phase 4: Warmup with VLA (fill replay buffer, no RL updates)
+    # IMPORTANT: Uses DecoupledWarmupPolicy — MoE policy for actions, VLAHook for z_rl only
     for ep in range(N_warm):
         obs = env.reset()
+        success_flag = False  # Latch success across chunks (matches eval.py:372-375)
         while not done:
+            # z_rl path: VLAHook (for replay buffer)
             z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
-            action_chunk = a_tilde[:, :C, :]               # use VLA directly
-            action_raw = normalizer.denormalize_action(action_chunk)
+
+            # Action path: MoE policy (same as eval — known to succeed)
+            # MoE policy has internal action queue (n_action_steps=12)
+            # Calling select_action C times drains the queue
+            actions = [moe_policy.select_action(obs) for _ in range(C)]
+            action_raw = np.stack(actions)  # (C, 12) in raw joint space
+
             rewards = []
+            chunk_success = False
             for t in range(C):
-                obs, reward, done = env.step(action_raw[t].cpu().numpy())
+                obs, reward, done = env.step(action_raw[t])
                 rewards.append(reward)
+                # Check success each step — garment may shift after initial fold
+                if env._get_success():
+                    chunk_success = True
+                    success_flag = True      # Latch: stays True for rest of episode
                 if done:
                     break                                        # early term on episode end
             n_exec = len(rewards)
             chunk_return = sum(gamma**k * r for k, r in enumerate(rewards))
-            # handle partial chunk
-            action_stored = action_chunk.clone()
+
+            # stored_action: MoE raw actions → normalized (for replay buffer)
+            action_tensor = torch.from_numpy(action_raw).float().to(device)
+            action_stored = normalizer.normalize_action(action_tensor).unsqueeze(0)
             if n_exec < C:
                 action_stored[:, n_exec:] = 0                  # zero-pad phantom steps
+
             next_z_rl, next_s_p = (zeros, zeros) if done else process_observation(obs, ...)
-            replay.add(z_rl, s_p, a_tilde, action_stored, chunk_return,
+            # ref_action from VLAHook (normalized) — for BC pretrain target
+            replay.add(z_rl, s_p, a_tilde[:, :C, :], action_stored, chunk_return,
                        next_z_rl, next_s_p, done)
 
     # Phase 4.5: BC Pretrain Actor (warm start from VLA behavior)
@@ -996,23 +1015,31 @@ BC loss in normalized space, naturally aligned with VLA output.
 ═══════════════════════════════════════════════════════════════════════
 
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Phase 4: WARMUP — 用 VLA 填充 ReplayBuffer (不训练 RL)            │
+│  Phase 4: WARMUP — 用 DecoupledWarmupPolicy 填充 ReplayBuffer          │
 │                                                                     │
 │  ┌──────────┐    ┌─────────┐    ┌─────────┐    ┌───────────────┐  │
 │  │  env obs │───▶│   VLA   │───▶│ RL Token │───▶│ z_rl + ã + s_p│  │
-│  │  (CPU)   │    │ z_vlm   │    │ encoder │    │               │  │
-│  │          │    │ + ã     │    │  → z_rl  │    │   action = ã  │  │
-│  └──────────┘    └─────────┘    └─────────┘    │  (直接用VLA)  │  │
-│       │                                         └───────┬───────┘  │
-│       │ env.step(ã)                                     │          │
-│       ▼                                                 ▼          │
-│  ┌──────────┐                                    ┌──────────────┐  │
-│  │ rewards  │                                    │ ReplayBuffer │  │
-│  │ r_0..r_9 │──── chunk_return ─────────────────▶│ .add(...)    │  │
-│  └──────────┘                                    └──────────────┘  │
+│  │  (CPU)   │    │ z_vlm   │    │ encoder │    │  (replay用)   │  │
+│  │          │    │ + ã     │    │  → z_rl  │    │               │  │
+│  └──────────┘    └─────────┘    └─────────┘    └───────┬───────┘  │
+│       │                                          │ z_rl, ref ã   │
+│       │                          ┌───────────────┐  (replay buffer)│
+│       │                          │ MoE Policy    │                 │
+│       │                          │ (eval pipeline)│                │
+│       │                          │ select_action │                 │
+│       │                          │ ×C = actions  │                 │
+│       │                          └───────┬───────┘                 │
+│       │ env.step(moe_actions)            │ action_raw              │
+│       ▼                                  ▼                         │
+│  ┌──────────┐                    ┌──────────────┐                  │
+│  │ rewards  │                    │ ReplayBuffer │                  │
+│  │ r_0..r_C │── chunk_return ──▶│ .add(...)    │                  │
+│  └──────────┘                    └──────────────┘                  │
 │                                                                     │
+│  ⚠ VLAStage2Hook 的 ã 质量差（zero success），仅用于 z_rl/ ref     │
+│  ⚠ 实际执行动作用 MoE policy（eval 管线，已知可成功）               │
+│  ⚠ success_flag 跨 chunk 锁存（garment 可能在成功后移位）          │
 │  重复 N_warm=20 episodes                                            │
-│  目的：给 Critic 一个初始学习信号                                    │
 └─────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
