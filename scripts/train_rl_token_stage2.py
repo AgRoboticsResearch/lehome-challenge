@@ -30,7 +30,6 @@ from lehome.models.rl_stage2 import (
     TwinCritic,
     RLTTrainer,
     ReplayBuffer,
-    SimpleNormalizer,
 )
 from lehome.models.rl_token import RLTokenStage1
 from lehome.models.vla_stage2_hook import VLAStage2Hook
@@ -38,6 +37,7 @@ from scripts.utils.chunk_runner import (
     WarmupPolicy,
     DecoupledWarmupPolicy,
     RLActorPolicy,
+    ExpertNorm,
     run_chunk_episodes,
 )
 
@@ -67,8 +67,6 @@ def train(cfg: dict, simulation_app):
     print("Phase 1: Loading Frozen Components")
     print("=" * 60)
 
-    normalizer = SimpleNormalizer(cfg["dataset_stats_path"], device)
-
     vla_hook = VLAStage2Hook(
         pretrained_path=cfg["smolvla_pretrained_path"],
         device=str(device),
@@ -84,7 +82,6 @@ def train(cfg: dict, simulation_app):
         p.requires_grad = False
     stage1.to(device)
 
-    print(f"  Normalizer: {cfg['dataset_stats_path']}")
     print(f"  VLA hook: {cfg['smolvla_pretrained_path']}")
     print(f"  Stage 1: {cfg['rl_token_stage1_path']}")
 
@@ -187,8 +184,22 @@ def train(cfg: dict, simulation_app):
     moe_policy = MoESmolVLAPolicy(device=str(device))
     print(f"  MoE policy loaded for decoupled warmup")
 
+    # Trigger a dummy forward to lock expert + extract expert normalization stats
+    # (MoE uses sticky routing — expert locks on first call)
+    dummy_obs = env._get_observations()
+    _ = moe_policy.select_action(dummy_obs)  # Locks expert
+    expert_stats = moe_policy.get_expert_norm_stats(device=str(device))
+    expert_norm = ExpertNorm(
+        state_mean=expert_stats["state_mean"],
+        state_std=expert_stats["state_std"],
+        action_mean=expert_stats["action_mean"],
+        action_std=expert_stats["action_std"],
+    )
+    print(f"  Expert norm stats extracted from locked expert: {moe_policy._locked_expert}")
+    moe_policy.reset()  # Reset sticky routing for fresh start
+
     warmup_policy = DecoupledWarmupPolicy(
-        moe_policy, vla_hook, stage1, normalizer, device, chunk_size
+        moe_policy, vla_hook, stage1, expert_norm, device, chunk_size
     )
 
     warmup_start = time.time()
@@ -247,7 +258,7 @@ def train(cfg: dict, simulation_app):
     best_reward = -float("inf")
 
     rl_policy = RLActorPolicy(
-        actor, vla_hook, stage1, normalizer, device,
+        actor, moe_policy, vla_hook, stage1, expert_norm, device,
         chunk_size, cfg["action_dim"],
     )
 

@@ -495,6 +495,42 @@ class MoESmolVLAPolicy(BasePolicy):
 
         return obs_dict
 
+    def get_expert_norm_stats(self, device: str = "cpu") -> dict[str, torch.Tensor]:
+        """Extract normalization stats from the locked expert's checkpoint.
+
+        Loads stats directly from the expert's preprocessor safetensors,
+        avoiding any dependency on external stats.json files.
+
+        Returns:
+            Dict with keys: state_mean, state_std, action_mean, action_std, eps
+        """
+        if self._locked_expert is None:
+            raise RuntimeError("No expert locked yet. Call select_action first.")
+
+        expert_path = Path(self.available_experts[self._locked_expert])
+
+        # Load preprocessor config to find normalizer step
+        with open(expert_path / "policy_preprocessor.json") as f:
+            preproc = json.load(f)
+
+        for step in preproc["steps"]:
+            if "normalizer" in step.get("registry_name", ""):
+                state_file = step["state_file"]
+                break
+        else:
+            raise ValueError("No normalizer step found in expert preprocessor")
+
+        from safetensors.torch import load_file
+        stats = load_file(expert_path / state_file)
+
+        return {
+            "state_mean": stats["observation.state.mean"].to(device),
+            "state_std": stats["observation.state.std"].to(device),
+            "action_mean": stats["action.mean"].to(device),
+            "action_std": stats["action.std"].to(device),
+            "eps": 1e-8,
+        }
+
     def _route_image(self, image: np.ndarray) -> tuple[str, float]:
         """
         Route image to appropriate expert using router.

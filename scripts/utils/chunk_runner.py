@@ -20,6 +20,33 @@ from scripts.utils.common import stabilize_garment_after_reset
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Expert normalization — single source of truth from expert checkpoint
+# ═══════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class ExpertNorm:
+    """Lightweight normalization using expert's own stats.
+
+    Replaces SimpleNormalizer. Stats come from the expert's preprocessor
+    safetensors (the same stats used during expert training).
+
+    All operations are simple tensor math — no class inheritance needed.
+    """
+    state_mean: torch.Tensor   # (state_dim,)
+    state_std: torch.Tensor    # (state_dim,)
+    action_mean: torch.Tensor  # (action_dim,)
+    action_std: torch.Tensor   # (action_dim,)
+    eps: float = 1e-8
+
+    def normalize_state(self, state: torch.Tensor) -> torch.Tensor:
+        return (state - self.state_mean) / (self.state_std + self.eps)
+
+    def denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        return action * (self.action_std + self.eps) + self.action_mean
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Low-level chunk execution — the core fix
 # ═══════════════════════════════════════════════════════════════════
 
@@ -143,7 +170,7 @@ class BaseChunkPolicy(abc.ABC):
         joint_pos = torch.as_tensor(
             obs["observation.state"], dtype=torch.float32, device=self.device
         ).unsqueeze(0)
-        s_p = self.normalizer.normalize_state(joint_pos)
+        s_p = self.expert_norm.normalize_state(joint_pos)
 
         return z_rl, a_tilde, s_p
 
@@ -183,11 +210,11 @@ class BaseChunkPolicy(abc.ABC):
 class WarmupPolicy(BaseChunkPolicy):
     """VLA-only policy for warmup. Actions = VLA reference directly."""
 
-    def __init__(self, vla_hook, stage1, normalizer, device, chunk_size):
+    def __init__(self, vla_hook, stage1, expert_norm, device, chunk_size):
         super().__init__()
         self.vla_hook = vla_hook
         self.stage1 = stage1
-        self.normalizer = normalizer
+        self.expert_norm = expert_norm
         self.device = device
         self.chunk_size = chunk_size
 
@@ -199,7 +226,7 @@ class WarmupPolicy(BaseChunkPolicy):
         else:
             z_rl, a_tilde, s_p = self._process_obs(obs)
         action_chunk_norm = a_tilde[:, :self.chunk_size, :]
-        action_raw = self.normalizer.denormalize_action(
+        action_raw = self.expert_norm.denormalize_action(
             action_chunk_norm
         ).squeeze(0).cpu().numpy()
         return ChunkResult(
@@ -233,12 +260,12 @@ class DecoupledWarmupPolicy(BaseChunkPolicy):
     detection, etc.).
     """
 
-    def __init__(self, moe_policy, vla_hook, stage1, normalizer, device, chunk_size):
+    def __init__(self, moe_policy, vla_hook, stage1, expert_norm, device, chunk_size):
         super().__init__()
         self.moe_policy = moe_policy    # MoESmolVLAPolicy (eval pipeline)
         self.vla_hook = vla_hook
         self.stage1 = stage1
-        self.normalizer = normalizer
+        self.expert_norm = expert_norm
         self.device = device
         self.chunk_size = chunk_size
 
@@ -285,13 +312,13 @@ class RLActorPolicy(BaseChunkPolicy):
     VLAHook only produces z_rl (skip_ode=True, saves ~30ms/chunk).
     """
 
-    def __init__(self, actor, moe_policy, vla_hook, stage1, normalizer, device, chunk_size, action_dim):
+    def __init__(self, actor, moe_policy, vla_hook, stage1, expert_norm, device, chunk_size, action_dim):
         super().__init__()
         self.actor = actor
         self.moe_policy = moe_policy
         self.vla_hook = vla_hook
         self.stage1 = stage1
-        self.normalizer = normalizer
+        self.expert_norm = expert_norm
         self.device = device
         self.chunk_size = chunk_size
         self.action_dim = action_dim
@@ -315,7 +342,7 @@ class RLActorPolicy(BaseChunkPolicy):
         # ── Actor forward (with MoE ref as conditioning, 50% dropout inside actor) ──
         self.actor.train()
         action_norm = self.actor(z_rl, s_p, ref_action)
-        action_raw = self.normalizer.denormalize_action(
+        action_raw = self.expert_norm.denormalize_action(
             action_norm.view(1, self.chunk_size, self.action_dim)
         ).squeeze(0).cpu().numpy()
 
