@@ -236,11 +236,6 @@ def train(cfg: dict, simulation_app):
     output_dir.mkdir(parents=True, exist_ok=True)
     best_reward = -float("inf")
 
-    rl_policy = RLActorPolicy(
-        actor, vla_hook, stage1, device,
-        chunk_size, cfg["action_dim"],
-    )
-
     def save_fn(ep_num, reward, success):
         nonlocal best_reward
         ckpt_path = output_dir / f"episode_{ep_num}.pt"
@@ -256,16 +251,17 @@ def train(cfg: dict, simulation_app):
             torch.save(actor.state_dict(), output_dir / "best_actor.pt")
             print(f"  New best: {best_reward:.3f}")
 
-    run_chunk_episodes(
+    run_rl_episodes(
         env=env,
-        policy=rl_policy,
-        num_episodes=cfg["total_episodes"],
+        actor=actor,
+        vla_hook=vla_hook,
+        stage1=stage1,
+        replay_buffer=replay,
+        rl_trainer=trainer,
         cfg=cfg,
         args=args_namespace,
-        replay_buffer=replay,
-        garment_list=all_garments,
-        rl_trainer=trainer,
         save_fn=save_fn,
+        garment_list=all_garments,
     )
 
     print("\n" + "=" * 60)
