@@ -29,6 +29,20 @@ warmup_episodes: 5
 max_episode_steps: 400
 gamma: 0.99
 
+# ── Training (same as train_rl_stage2.yaml) ──
+actor_lr: 3.0e-4
+critic_lr: 3.0e-4
+tau: 0.005
+beta: 0.1
+actor_delay: 2
+target_noise_std: 0.2
+noise_clip: 0.5
+grad_clip: 1.0
+bc_lr: 1.0e-3
+bc_pretrain_epochs: 10
+bc_loss_threshold: 0.01
+batch_size: 256
+
 # ── Device ──
 device: cuda
 env_device: cpu

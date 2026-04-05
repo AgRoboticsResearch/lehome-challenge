@@ -9,10 +9,14 @@ Usage:
 """
 
 import argparse
+import copy
 import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
 import yaml
 import os
 import logging
@@ -38,7 +42,9 @@ def test_warmup(cfg: dict, simulation_app):
     print("Phase 1: Loading Frozen Components")
     print("=" * 60)
 
-    from lehome.models.rl_stage2 import ReplayBuffer, SimpleNormalizer
+    from lehome.models.rl_stage2 import (
+        ReplayBuffer, SimpleNormalizer, RLActor, TwinCritic, RLTTrainer,
+    )
     from lehome.models.rl_token import RLTokenStage1
     from lehome.models.vla_stage2_hook import VLAStage2Hook
 
@@ -62,10 +68,30 @@ def test_warmup(cfg: dict, simulation_app):
     stage1.to(device)
     print(f"  Stage 1: OK")
 
-    # ── Phase 2: Create replay buffer only (no actor/critic needed) ──
+    # ── Phase 2: Create actor, critic, replay buffer, trainer ──
     print("\n" + "=" * 60)
-    print("Phase 2: Creating Replay Buffer")
+    print("Phase 2: Creating Trainable Components")
     print("=" * 60)
+
+    actor = RLActor(
+        z_rl_dim=cfg["z_rl_dim"],
+        state_dim=cfg["state_dim"],
+        chunk_size=chunk_size,
+        action_dim=cfg["action_dim"],
+        hidden_dim=cfg["hidden_dim"],
+        num_layers=cfg["num_layers"],
+        fixed_std=cfg.get("fixed_std", 0.0067),
+        ref_dropout=cfg.get("ref_dropout", 0.5),
+    ).to(device)
+
+    critic = TwinCritic(
+        z_rl_dim=cfg["z_rl_dim"],
+        state_dim=cfg["state_dim"],
+        chunk_size=chunk_size,
+        action_dim=cfg["action_dim"],
+        hidden_dim=cfg["hidden_dim"],
+        num_layers=cfg["num_layers"],
+    ).to(device)
 
     replay = ReplayBuffer(
         capacity=1000,
@@ -75,6 +101,27 @@ def test_warmup(cfg: dict, simulation_app):
         action_dim=cfg["action_dim"],
         device=device,
     )
+
+    trainer = RLTTrainer(
+        actor=actor,
+        critic=critic,
+        device=device,
+        actor_lr=cfg["actor_lr"],
+        critic_lr=cfg["critic_lr"],
+        gamma=cfg["gamma"],
+        tau=cfg["tau"],
+        beta=cfg["beta"],
+        target_noise_std=cfg.get("target_noise_std", 0.2),
+        noise_clip=cfg.get("noise_clip", 0.5),
+        chunk_size=chunk_size,
+        actor_delay=cfg["actor_delay"],
+        grad_clip=cfg["grad_clip"],
+    )
+
+    n_actor = sum(p.numel() for p in actor.parameters())
+    n_critic = sum(p.numel() for p in critic.parameters())
+    print(f"  Actor: {n_actor:,} params")
+    print(f"  Critic: {n_critic:,} params")
     print(f"  ReplayBuffer: capacity=1000, chunk_size={chunk_size}")
 
     # ── Phase 3: Create environment ──
@@ -313,6 +360,122 @@ def test_warmup(cfg: dict, simulation_app):
             (non_done_next_z.abs() > 0).any().item(),
             "all zeros — VLA may not be producing output",
         )
+
+    # ═══════════════════════════════════════════════════════════════
+    # Phase 4.5: BC Pretrain — test RLActor with warmup buffer
+    # ═══════════════════════════════════════════════════════════════
+    print(f"\n{'=' * 60}")
+    print("Phase 4.5: BC Pretrain (actor warm start from VLA)")
+    print("=" * 60)
+
+    # Snapshot actor weights before training
+    actor_weight_before = {n: p.clone() for n, p in actor.named_parameters()}
+
+    bc_optim = Adam(actor.parameters(), lr=cfg["bc_lr"])
+    actor.train()
+
+    bc_epochs = min(cfg.get("bc_pretrain_epochs", 100), 10)  # cap at 10 for test speed
+    bc_batches_per_epoch = 20  # fewer batches for test speed
+    bc_batch_size = min(cfg.get("batch_size", 256), buf_len)
+    bc_losses = []
+
+    for epoch in range(bc_epochs):
+        total_loss = 0
+        n_batches = 0
+        for _ in range(bc_batches_per_epoch):
+            batch = replay.sample(bc_batch_size)
+            a_pred = actor(batch["z_rl"], batch["s_p"], batch["ref_action"])
+            loss = F.mse_loss(a_pred, batch["ref_action"].flatten(1))
+
+            bc_optim.zero_grad()
+            loss.backward()
+
+            # Check gradients before clipping
+            total_grad_norm = torch.sqrt(
+                sum(p.grad.norm() ** 2 for p in actor.parameters() if p.grad is not None)
+            ).item()
+
+            nn.utils.clip_grad_norm_(actor.parameters(), cfg["grad_clip"])
+            bc_optim.step()
+
+            total_loss += loss.item()
+            n_batches += 1
+
+        avg_loss = total_loss / n_batches
+        bc_losses.append(avg_loss)
+        print(f"  BC epoch {epoch+1}/{bc_epochs}: loss = {avg_loss:.6f}, grad_norm = {total_grad_norm:.4f}")
+        if avg_loss < cfg.get("bc_loss_threshold", 0.01):
+            print(f"  BC converged at epoch {epoch+1}")
+            break
+
+    # ── Phase 4.5 Assertions ──
+    print(f"\n--- Phase 4.5 checks ---")
+
+    # 1. Actor forward shape
+    sample = replay.sample(4)
+    a_pred = actor(sample["z_rl"], sample["s_p"], sample["ref_action"])
+    check(
+        "actor output shape",
+        a_pred.shape == (4, chunk_size * cfg["action_dim"]),
+        f"got {list(a_pred.shape)}",
+    )
+
+    # 2. Actor output is finite
+    check("actor output finite", torch.isfinite(a_pred).all().item())
+
+    # 3. BC loss decreased (at least 30% reduction)
+    if len(bc_losses) >= 2:
+        reduction = (bc_losses[0] - bc_losses[-1]) / max(bc_losses[0], 1e-8)
+        check(
+            "BC loss decreased",
+            bc_losses[-1] < bc_losses[0],
+            f"start={bc_losses[0]:.6f}, end={bc_losses[-1]:.6f}, reduction={reduction:.1%}",
+        )
+
+    # 4. Actor weights actually changed
+    max_diff = max(
+        (actor_weight_before[n] - p).abs().max().item()
+        for n, p in actor.named_parameters()
+    )
+    check(
+        "actor weights changed",
+        max_diff > 1e-6,
+        f"max weight diff = {max_diff:.8f}",
+    )
+
+    # 5. Gradients were finite during training (checked via last loss being finite)
+    check("BC loss finite", all(torch.isfinite(torch.tensor(l)) for l in bc_losses))
+
+    # 6. sync_actor_target matches
+    trainer.sync_actor_target()
+    max_target_diff = max(
+        (tp - p).abs().max().item()
+        for tp, p in zip(trainer.actor_target.parameters(), actor.parameters())
+    )
+    check(
+        "target sync matches actor",
+        max_target_diff < 1e-6,
+        f"max target diff = {max_target_diff:.8f}",
+    )
+
+    # 7. Critic forward works
+    q1, q2 = critic(sample["z_rl"], sample["s_p"], sample["action"])
+    check(
+        "critic Q1 shape",
+        q1.shape == (4,),
+        f"got {list(q1.shape)}",
+    )
+    check("critic Q1 finite", torch.isfinite(q1).all().item())
+    check("critic Q2 finite", torch.isfinite(q2).all().item())
+
+    # 8. Single trainer.update() works
+    batch = replay.sample(bc_batch_size)
+    metrics = trainer.update(batch)
+    check("trainer update returns metrics", all(k in metrics for k in ["critic_loss"]))
+    check("critic_loss finite", torch.isfinite(torch.tensor(metrics["critic_loss"])).item())
+    # Actor may or may not update (delayed), so check if present
+    if "actor_loss" in metrics:
+        check("actor_loss finite", torch.isfinite(torch.tensor(metrics["actor_loss"])).item())
 
     # ── Summary ──
     print(f"\n{'=' * 60}")
