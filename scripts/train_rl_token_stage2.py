@@ -10,16 +10,16 @@ Pipeline:
     Phase 4:   Warmup — fill ReplayBuffer with VLA actions (no RL)
     Phase 4.5: BC pretrain — initialize actor to mimic VLA
     Phase 5:   Online RL — TD3+BC training loop
+
+Env interaction is handled by chunk_runner which reuses correct patterns
+from evaluation.py (env._get_rewards, env._get_success, stabilize, etc).
 """
 
 import argparse
-import copy
-import json
 import random
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,98 +34,18 @@ from lehome.models.rl_stage2 import (
 )
 from lehome.models.rl_token import RLTokenStage1
 from lehome.models.vla_stage2_hook import VLAStage2Hook
-
+from scripts.utils.chunk_runner import (
+    WarmupPolicy,
+    RLActorPolicy,
+    run_chunk_episodes,
+)
 
 import yaml
-
-
 import os
-
 
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
-
-
 os.environ.setdefault("TOKENIZERS_PARALLEL", "1")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Observation preprocessing
-# ═══════════════════════════════════════════════════════════════════
-
-
-def prepare_obs_batch(obs: dict, device: torch.device) -> dict[str, torch.Tensor]:
-    """Convert env._get_observations() output to VLAStage2Hook format.
-
-    env output:
-        observation.images.*_rgb: (H, W, 4) uint8 RGBA numpy  ← Isaac Sim "rgb" = 4ch
-        observation.state:         (12,)     float32 numpy
-    hook expects:
-        observation.images.*_rgb: (1, C, H, W) float32 tensor [0, 1]
-        observation.state:         (1, 12)     float32 tensor
-    """
-    batch = {}
-    for key, value in obs.items():
-        if not key.startswith("observation."):
-            continue
-        if isinstance(value, np.ndarray):
-            t = torch.from_numpy(value.copy()).float()
-            if t.ndim == 3 and t.shape[-1] >= 3:  # Image (H, W, C)
-                t = t[..., :3]                      # RGBA → RGB
-                t = t / 255.0                       # [0, 255] → [0, 1]
-                t = t.permute(2, 0, 1)              # (H, W, C) → (C, H, W)
-            t = t.unsqueeze(0).to(device)           # +batch dim, to GPU
-            batch[key] = t
-    return batch
-
-
-@torch.no_grad()
-def process_observation(obs_dict, vla_hook, stage1, normalizer, device):
-    """Full pipeline: env obs → (z_rl, a_tilde, s_p).
-
-    Returns:
-        z_rl:    (1, 960) — RL Token state
-        a_tilde: (1, 50, 12) — VLA reference action chunk (normalized)
-        s_p:     (1, 12) — normalized joint positions
-    """
-    batch = prepare_obs_batch(obs_dict, device)
-    z_vlm, a_tilde = vla_hook.forward(batch)
-
-    z_target = stage1.apply_keep_mask(z_vlm)
-    z_rl = stage1.encoder(z_target)
-
-    joint_pos = torch.as_tensor(
-        obs_dict["observation.state"], dtype=torch.float32, device=device
-    ).unsqueeze(0)
-    s_p = normalizer.normalize_state(joint_pos)
-
-    return z_rl, a_tilde, s_p
-
-
-def execute_chunk(env, action_raw: np.ndarray, max_steps: int, gamma: float):
-    """Execute action chunk open-loop, checking success each step."""
-    rewards = []
-    done = False
-    for t in range(max_steps):
-        action_tensor = torch.from_numpy(action_raw[t]).float().unsqueeze(0)
-        obs, reward, terminated, truncated, info = env.step(action_tensor)
-        done = terminated.item() if torch.is_tensor(terminated) else bool(terminated)
-        # Use _get_rewards() like eval does — env.step() may return stale/zero reward
-        reward_value = env._get_rewards()
-        r = reward_value.item() if torch.is_tensor(reward_value) else float(reward_value)
-        rewards.append(r)
-        if done:
-            break
-        # Success doesn't trigger terminated — check explicitly
-        success = env._get_success()
-        if success.item() if torch.is_tensor(success) else bool(success):
-            done = True
-            break
-    return rewards, done, obs
-
-
-def compute_chunk_return(rewards: list[float], gamma: float) -> float:
-    return sum(gamma ** t * r for t, r in enumerate(rewards))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -136,12 +56,10 @@ def compute_chunk_return(rewards: list[float], gamma: float) -> float:
 def train(cfg: dict, simulation_app):
     import gymnasium as gym
     from isaaclab_tasks.utils import parse_env_cfg
-    from scripts.utils.common import stabilize_garment_after_reset
 
     device = torch.device(cfg["device"])
     env_device = cfg.get("env_device", "cpu")
     chunk_size = cfg["chunk_size"]
-    gamma = cfg["gamma"]
 
     # ── Phase 1: Load frozen Components ──
     print("=" * 60)
@@ -209,7 +127,7 @@ def train(cfg: dict, simulation_app):
         device=device,
         actor_lr=cfg["actor_lr"],
         critic_lr=cfg["critic_lr"],
-        gamma=gamma,
+        gamma=cfg["gamma"],
         tau=cfg["tau"],
         beta=cfg["beta"],
         target_noise_std=cfg.get("target_noise_std", 0.2),
@@ -219,7 +137,6 @@ def train(cfg: dict, simulation_app):
         grad_clip=cfg["grad_clip"],
     )
 
-    total_params = sum(p.numel() for p in actor.parameters()) + sum(p.numel() for p in critic.parameters())
     print(f"  Actor: {sum(p.numel() for p in actor.parameters()):,} params")
     print(f"  Critic: {sum(p.numel() for p in critic.parameters()):,} params")
     print(f"  ReplayBuffer: {cfg['replay_capacity']:,} capacity")
@@ -233,7 +150,7 @@ def train(cfg: dict, simulation_app):
         "task": cfg.get("task", "LeHome-BiSO101-Direct-Garment-v2"),
         "device": env_device,
         "seed": cfg.get("seed", 42),
-    "use_random_seed": False,
+        "use_random_seed": False,
         "garment_cfg_base_path": cfg.get("garment_cfg_base_path", "Assets/objects/Challenge_Garment"),
         "particle_cfg_path": cfg.get("particle_cfg_path", "source/lehome/lehome/tasks/bedroom/config_file/particle_garment_cfg.yaml"),
         "teleop_device": "keyboard",
@@ -252,77 +169,30 @@ def train(cfg: dict, simulation_app):
 
     # Load garment list for random sampling
     parts = cfg["garment_name"].split("_")
-    garment_type = f"{parts[0]}_{parts[1]}"  # e.g., "Top_Long"
+    garment_type = f"{parts[0]}_{parts[1]}"
     garment_list_path = Path(cfg["garment_cfg_base_path"]) / "Release" / garment_type / f"{garment_type}.txt"
     with open(garment_list_path) as f:
         all_garments = [line.strip() for line in f if line.strip()]
     seen_garments = [g for g in all_garments if "Seen" in g]
     print(f"  Garment pool: {len(seen_garments)} seen + {len(all_garments) - len(seen_garments)} unseen = {len(all_garments)} total")
 
-    # ── Phase 4: Warmup ──
+    # ── Phase 4: Warmup (via chunk_runner) ──
     print("\n" + "=" * 60)
     print(f"Phase 4: Warmup ({cfg['warmup_episodes']} episodes)")
     print("=" * 60)
 
+    warmup_policy = WarmupPolicy(vla_hook, stage1, normalizer, device, chunk_size)
+
     warmup_start = time.time()
-    for ep in range(cfg["warmup_episodes"]):
-        garment = random.choice(seen_garments)
-        env.switch_garment(garment, "Release")
-        env.reset()
-        stabilize_garment_after_reset(env, args_namespace)
-        obs = env._get_observations()
-
-        z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
-        episode_reward = 0
-        episode_steps = 0
-        max_steps = cfg.get("max_episode_steps", 300)
-
-        while episode_steps < max_steps:
-            # Use VLA actions directly
-            action_chunk_norm = a_tilde[:, :chunk_size, :]
-            action_raw_np = normalizer.denormalize_action(action_chunk_norm).squeeze(0).cpu().numpy()
-
-            rewards, done, last_obs = execute_chunk(env, action_raw_np, chunk_size, gamma)
-            n_exec = len(rewards)
-            chunk_return = compute_chunk_return(rewards, gamma)
-            episode_reward += sum(rewards)
-            episode_steps += n_exec
-
-            action_stored = action_chunk_norm.clone()
-            if n_exec < chunk_size:
-                action_stored[:, n_exec:] = 0
-
-            if done:
-                next_z_rl = torch.zeros(1, cfg["z_rl_dim"], device=device)
-                next_s_p = torch.zeros(1, cfg["state_dim"], device=device)
-            else:
-                last_obs_dict = env._get_observations()
-                next_z_rl, _, next_s_p = process_observation(
-                    last_obs_dict, vla_hook, stage1, normalizer, device
-                )
-
-            replay.add(
-                z_rl=z_rl, s_p=s_p,
-                ref_action=a_tilde[:, :chunk_size, :],
-                action=action_stored,
-                reward=chunk_return,
-                next_z_rl=next_z_rl, next_s_p=next_s_p,
-                done=done,
-            )
-
-            if done:
-                break
-
-            obs = env._get_observations()
-            z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
-
-        success = env._get_success()
-        is_success = success.item() if torch.is_tensor(success) else bool(success)
-        avg_reward = episode_reward / max(episode_steps, 1)
-        print(f"  Ep {ep+1}/{cfg['warmup_episodes']}: reward={episode_reward:.3f}, "
-              f"steps={episode_steps}, avg_r/step={avg_reward:.4f}, "
-              f"buffer={len(replay)}, Success={is_success}")
-
+    run_chunk_episodes(
+        env=env,
+        policy=warmup_policy,
+        num_episodes=cfg["warmup_episodes"],
+        cfg=cfg,
+        args=args_namespace,
+        replay_buffer=replay,
+        garment_list=seen_garments,
+    )
     warmup_time = time.time() - warmup_start
     print(f"  Warmup done: {len(replay)} transitions in {warmup_time:.1f}s")
 
@@ -339,7 +209,6 @@ def train(cfg: dict, simulation_app):
         n_batches = 0
         for _ in range(cfg["bc_batches_per_epoch"]):
             batch = replay.sample(cfg["batch_size"])
-            # Full ref, no dropout during BC pretrain
             a_pred = actor(batch["z_rl"], batch["s_p"], batch["ref_action"])
             loss = F.mse_loss(a_pred, batch["ref_action"].flatten(1))
 
@@ -360,7 +229,7 @@ def train(cfg: dict, simulation_app):
     trainer.sync_actor_target()
     print("  Actor target synced with BC-pretrained weights")
 
-    # ── Phase 5: Online RL ──
+    # ── Phase 5: Online RL (via chunk_runner) ──
     print("\n" + "=" * 60)
     print(f"Phase 5: Online RL ({cfg['total_episodes']} episodes)")
     print("=" * 60)
@@ -369,94 +238,37 @@ def train(cfg: dict, simulation_app):
     output_dir.mkdir(parents=True, exist_ok=True)
     best_reward = -float("inf")
 
-    for ep in range(cfg["total_episodes"]):
-        garment = random.choice(all_garments)
-        env.switch_garment(garment, "Release")
-        env.reset()
-        stabilize_garment_after_reset(env, args_namespace)
-        obs = env._get_observations()
+    rl_policy = RLActorPolicy(
+        actor, vla_hook, stage1, normalizer, device,
+        chunk_size, cfg["action_dim"],
+    )
 
-        z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
-        episode_reward = 0
-        episode_steps = 0
-        max_steps = cfg.get("max_episode_steps", 300)
-        episode_metrics = {"critic_loss": [], "actor_loss": [], "bc_loss": []}
+    def save_fn(ep_num, reward, success):
+        nonlocal best_reward
+        ckpt_path = output_dir / f"episode_{ep_num}.pt"
+        torch.save({
+            "actor": actor.state_dict(),
+            "critic": critic.state_dict(),
+            "episode": ep_num,
+            "episode_reward": reward,
+        }, ckpt_path)
+        print(f"  Checkpoint: {ckpt_path}")
+        if reward > best_reward:
+            best_reward = reward
+            torch.save(actor.state_dict(), output_dir / "best_actor.pt")
+            print(f"  New best: {best_reward:.3f}")
 
-        while episode_steps < max_steps:
-            # Actor forward with ref dropout
-            actor.train()
-            action_norm = actor(z_rl, s_p, a_tilde[:, :chunk_size, :])
-            action_raw = normalizer.denormalize_action(
-                action_norm.view(1, chunk_size, cfg["action_dim"])
-            ).squeeze(0).detach().cpu().numpy()
-
-            rewards, done, last_obs = execute_chunk(env, action_raw, chunk_size, gamma)
-            n_exec = len(rewards)
-            chunk_return = compute_chunk_return(rewards, gamma)
-            episode_reward += sum(rewards)
-            episode_steps += n_exec
-
-            action_stored = action_norm.detach().view(1, chunk_size, cfg["action_dim"]).clone()
-            if n_exec < chunk_size:
-                action_stored[:, n_exec:] = 0
-
-            if done:
-                next_z_rl = torch.zeros(1, cfg["z_rl_dim"], device=device)
-                next_s_p = torch.zeros(1, cfg["state_dim"], device=device)
-            else:
-                last_obs_dict = env._get_observations()
-                next_z_rl, _, next_s_p = process_observation(
-                    last_obs_dict, vla_hook, stage1, normalizer, device
-                )
-
-            replay.add(
-                z_rl=z_rl, s_p=s_p,
-                ref_action=a_tilde[:, :chunk_size, :],
-                action=action_stored,
-                reward=chunk_return,
-                next_z_rl=next_z_rl, next_s_p=next_s_p,
-                done=done,
-            )
-
-            # RL updates
-            for _ in range(cfg["update_to_data_ratio"]):
-                if len(replay) >= cfg["batch_size"]:
-                    batch = replay.sample(cfg["batch_size"])
-                    metrics = trainer.update(batch)
-                    for k in episode_metrics:
-                        if k in metrics:
-                            episode_metrics[k].append(metrics[k])
-
-            if done:
-                break
-
-            obs = env._get_observations()
-            z_rl, a_tilde, s_p = process_observation(obs, vla_hook, stage1, normalizer, device)
-
-        success = env._get_success()
-        is_success = success.item() if torch.is_tensor(success) else bool(success)
-        avg_reward = episode_reward / max(episode_steps, 1)
-        avg_metrics = {k: sum(v) / len(v) for k, v in episode_metrics.items() if v}
-        metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in avg_metrics.items())
-        print(f"  Ep {ep+1}: reward={episode_reward:.3f}, steps={episode_steps}, "
-              f"avg_r/step={avg_reward:.4f}, buffer={len(replay)}, Success={is_success}"
-              + (f", {metrics_str}" if metrics_str else ""))
-
-        if (ep + 1) % cfg["save_freq"] == 0:
-            ckpt_path = output_dir / f"episode_{ep+1}.pt"
-            torch.save({
-                "actor": actor.state_dict(),
-                "critic": critic.state_dict(),
-                "episode": ep + 1,
-                "episode_reward": episode_reward,
-            }, ckpt_path)
-            print(f"  Checkpoint: {ckpt_path}")
-
-            if episode_reward > best_reward:
-                best_reward = episode_reward
-                best_path = output_dir / "best_actor.pt"
-                torch.save(actor.state_dict(), best_path)
-                print(f"  New best: {best_reward:.3f}")
+    run_chunk_episodes(
+        env=env,
+        policy=rl_policy,
+        num_episodes=cfg["total_episodes"],
+        cfg=cfg,
+        args=args_namespace,
+        replay_buffer=replay,
+        garment_list=all_garments,
+        rl_trainer=trainer,
+        save_fn=save_fn,
+    )
 
     print("\n" + "=" * 60)
     print(f"Training complete. Best reward: {best_reward:.3f}")
@@ -476,7 +288,6 @@ def main():
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
 
-    # Load config
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
@@ -485,13 +296,11 @@ def main():
         print(f"  {k}: {v}")
     print()
 
-    # Launch Isaac Sim
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
     try:
         import lehome.tasks.bedroom  # noqa: F401 — register tasks
-
         train(cfg, simulation_app)
     except Exception as e:
         print(f"Error: {e}")
@@ -503,4 +312,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
