@@ -12,40 +12,11 @@ from typing import Dict, List
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from server import BasePolicyServer
 
 # Garment type definitions
 GARMENT_TYPES = ["top_short", "top_long", "pant_short", "pant_long"]
-
-
-class GarmentRouter(nn.Module):
-    """MLP classifier for garment type routing."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dims: list = [512, 256, 128],
-        num_classes: int = 4,
-        dropout: float = 0.3,
-    ):
-        super().__init__()
-        layers = []
-        prev_dim = input_dim
-        for i, hidden_dim in enumerate(hidden_dims):
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout if i < len(hidden_dims) - 1 else dropout * 0.7),
-            ])
-            prev_dim = hidden_dim
-        layers.append(nn.Linear(prev_dim, num_classes))
-        self.classifier = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.classifier(x)
 
 
 class MoEPolicy(BasePolicyServer):
@@ -82,7 +53,6 @@ class MoEPolicy(BasePolicyServer):
             "top_short": checkpoint_dir / "smolvla_moe_expert_top_short_no_st_proj/checkpoints/008000/pretrained_model",
             "top_long": checkpoint_dir / "smolvla_moe_expert_top_long_no_st_proj/checkpoints/008000/pretrained_model",
         }
-        router_path = checkpoint_dir / "router_all_frames/checkpoints/best/router.pt"
 
         # Discover available experts
         self.available_experts = {}
@@ -152,24 +122,6 @@ class MoEPolicy(BasePolicyServer):
                     p.requires_grad = False
             print(f"  [OK] Loaded expert for {gtype}")
 
-        # Load router
-        print(f"Loading router from {router_path}")
-        if not router_path.exists():
-            raise FileNotFoundError(f"Router checkpoint not found: {router_path}")
-        checkpoint = torch.load(str(router_path), map_location=self.device, weights_only=False)
-        config = checkpoint["config"]
-        self.router = GarmentRouter(
-            input_dim=config["input_dim"],
-            hidden_dims=config["hidden_dims"],
-            num_classes=config["num_classes"],
-        ).to(self.device)
-        self.router.load_state_dict(checkpoint["router_state_dict"])
-
-        # Match VLM dtype
-        vlm_dtype = next(self.vlm_with_expert.parameters()).dtype
-        self.router = self.router.to(vlm_dtype)
-        self.router.eval()
-
         # Episode state (sticky routing)
         self._locked_expert = None
         self._selected_expert = None
@@ -200,54 +152,95 @@ class MoEPolicy(BasePolicyServer):
         return [action]
 
     def _route_image(self, image: np.ndarray):
-        """Route image to appropriate expert using router."""
-        img_tensor = torch.from_numpy(image.copy()).float()
-        if img_tensor.max() > 1.0:
-            img_tensor = img_tensor / 255.0
-        # HWC -> CHW
-        if img_tensor.ndim == 3 and img_tensor.shape[-1] == 3:
-            img_tensor = img_tensor.permute(2, 0, 1)
-        img_tensor = img_tensor.unsqueeze(0).to(self.device)
+        """Route image using Qwen3-VL zero-shot VQA."""
 
-        # Resize and normalize
-        if self.resize_hw is not None:
-            img_tensor = self.resize_with_pad(img_tensor, *self.resize_hw, pad_value=0)
-        img_tensor = img_tensor * 2.0 - 1.0
+        # Lazy-load Qwen on first call
+        if not hasattr(self, '_qwen_model'):
+            from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+            print("  Loading Qwen3-VL-8B for routing...")
+            self._qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                "Qwen/Qwen3-VL-8B-Instruct",
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+            )
+            self._qwen_processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
+            print("  Qwen3-VL loaded")
 
-        # Extract VLM features
+        from PIL import Image
+        from qwen_vl_utils import process_vision_info
+
+        VALID_TYPES = {"top_short", "top_long", "pant_short", "pant_long"}
+
+        # Build VQA prompt
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": Image.fromarray(image)},
+                {"type": "text", "text": (
+                    "Look at this garment on a table from a top-down camera view. "
+                    "Classify it as exactly one of: top_short, top_long, pant_short, pant_long. "
+                    "Reply with only the label, nothing else."
+                )},
+            ],
+        }]
+
+        text = self._qwen_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = self._qwen_processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        ).to(self.device)
+
         with torch.no_grad():
-            img_emb = self.vlm_with_expert.embed_image(img_tensor)
-            if img_emb.dim() == 2:
-                img_emb = img_emb.unsqueeze(0)
+            generated_ids = self._qwen_model.generate(**inputs, max_new_tokens=10)
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            response = self._qwen_processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True
+            )[0].strip().lower()
 
-            # Rich features: mean + std + max pooling
-            mean_f = img_emb.mean(dim=1)
-            std_f = img_emb.std(dim=1)
-            max_f = img_emb.max(dim=1).values
-            rich_features = torch.cat([mean_f, std_f, max_f], dim=-1)
-            rich_features = torch.nn.functional.normalize(rich_features, p=2, dim=-1)
+        print(f"  Qwen response: '{response}'")
 
-            logits = self.router(rich_features)
-            probs = torch.softmax(logits, dim=-1)
-            predicted_class = probs.argmax(dim=-1).item()
-            confidence = probs[0, predicted_class].item()
-            garment_type = GARMENT_TYPES[predicted_class]
+        # Parse response to garment type
+        garment_type = None
+        confidence = 1.0
+        for gt in GARMENT_TYPES:
+            if gt in response or gt.replace("_", " ") in response:
+                garment_type = gt
+                break
 
-        # Smart fallback for missing experts
+        if garment_type is None:
+            # Try broader matching
+            if "top" in response or "shirt" in response:
+                if "short" in response or "t-shirt" in response:
+                    garment_type = "top_short"
+                else:
+                    garment_type = "top_long"
+            elif "pant" in response or "trouser" in response or "jean" in response:
+                if "short" in response or "shorts" in response:
+                    garment_type = "pant_short"
+                else:
+                    garment_type = "pant_long"
+            else:
+                # Default fallback
+                garment_type = GARMENT_TYPES[0]
+                confidence = 0.0
+                print(f"  Warning: couldn't parse Qwen response, defaulting to {garment_type}")
+
+        # Fallback for missing experts
         if garment_type in self.missing_experts:
-            print(f"  Warning: router predicted '{garment_type}' but expert not available")
+            print(f"  Warning: Qwen predicted '{garment_type}' but expert not available")
             best_type = None
-            best_prob = -1
-            for idx, gt in enumerate(GARMENT_TYPES):
+            for gt in GARMENT_TYPES:
                 if gt in self.available_experts:
-                    p = probs[0, idx].item()
-                    if p > best_prob:
-                        best_prob = p
-                        best_type = gt
+                    best_type = gt
+                    break
             if best_type:
-                print(f"  Fallback: '{garment_type}' -> '{best_type}' (prob: {best_prob:.3f})")
                 garment_type = best_type
-                confidence = best_prob
             else:
                 raise RuntimeError("No experts available!")
 
