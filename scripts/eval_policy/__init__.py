@@ -12,6 +12,7 @@ from .registry import PolicyRegistry
 from .lerobot_policy import LeRobotPolicy
 from .example_participant_policy import CustomPolicy
 from .moe_smolvla_policy import MoESmolVLAPolicy  # MoE policy
+from .docker_policy import DockerPolicy
 
 __all__ = [
     "BasePolicy",
@@ -19,4 +20,5 @@ __all__ = [
     "LeRobotPolicy",
     "CustomPolicy",
     "MoESmolVLAPolicy",  # MoE policy
+    "DockerPolicy",
 ]

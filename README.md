@@ -21,8 +21,16 @@
 
 </div>
 
+## ⚠️ **Important Reminder**
+
+> During evaluation, garments from different categories will be loaded randomly.
+> Participants cannot access the ground-truth garment category labels in the simulator during evaluation.
+> Therefore, if your policy requires garment labels, you must design your own method to obtain them (e.g., train a classifier).
+> Please submit a policy that is appropriate for this evaluation protocol.
+
 ## 📑 Table of Contents
 
+- [⚠️ **Important Reminder**](#️-important-reminder)
 - [📑 Table of Contents](#-table-of-contents)
 - [🚀 Quick Start](#-quick-start)
   - [1. Installation](#1-installation)
@@ -170,9 +178,14 @@ Evaluation is performed on the `Release` set of garments. Under the directory `A
 
 ## 📮 Submission
 
-Once you are satisfied with your model's performance, follow these steps to submit your results to the competition leaderboard:
+Once you are satisfied with your model's performance, submit your results through this [google form](https://docs.google.com/forms/d/e/1FAIpQLSeeFpV4oYxSizNCnplX1Ew--TBafIbVyFg9NPH-hunks2rc7Q/viewform). In summary, the submitted files include: 
 
->Submission instructions will be available on the [competition website](https://lehome-challenge.com/).
+- A **README (.md) file** that provides detailed instructions on how we can evaluate your policy.
+- A **docker image URL** or **huggingface repo link** that contains your checkpoints, source code and any other dependencies required for evaluation.
+- The .txt file which contains rollout results you performed. 
+- Source Code File(Optional, but highly encouraged). You can provide a link to your source code repository. This will NOT be used for evaluation, but it allows us to debug things easier if anything goes wrong during evaluation.
+
+>Please check the google form for more detailed submission information.
 
 ## 🧩 Acknowledgments
 
